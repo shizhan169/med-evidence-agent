@@ -4,3 +4,4 @@ __pycache__/
 data/chroma/
 data/chunks_preview.json
 .venv/
+models/  # 本地下载的 embedding 模型（约 90MB），不进仓库
