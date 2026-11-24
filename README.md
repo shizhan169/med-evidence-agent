@@ -27,9 +27,9 @@ Python + FastAPI + LangGraph + Chroma + SQLite + Streamlit + Docker
 ```bash
 conda create -n medevidence python=3.11 -y
 conda activate medevidence
-pip install -r requirements.txt
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple  # 国内用清华源，快很多
 cp .env.example .env  # 填入 QWEN_API_KEY 或 DEEPSEEK_API_KEY
-python -m app.ingest --papers data/papers
+python -m app.ingest --papers data/papers  # 首次运行会下载 embedding 模型（约 90MB），耐心等几分钟，只需一次
 uvicorn app.main:app --reload --port 8000
 streamlit run app/streamlit_app.py
 ```
