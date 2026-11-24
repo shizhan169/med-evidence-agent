@@ -13,7 +13,7 @@
 - `预期答案：` （仅可回答题）一两句话，来自论文原文
 - `预期来源：` （仅可回答题）论文文件名 + PDF 页码，格式 `文件名 p.页码`；
   同一事实在多页出现时用顿号列出多个页码，命中任一页即算引用命中，
-  例如 `fujita2023-brain-volume-aging.pdf p.1、p.4`
+  例如 `2023-fujita-brain-volume-aging.pdf p.1、p.4`
 - `拒答原因：` （仅应拒答题）为什么这道题应该拒答
 
 ## 可回答题（15 道）
@@ -22,91 +22,91 @@
 问题：Bethlehem 2022 的脑图谱研究共汇集了多少 MRI 扫描、多少受试者，年龄跨度多大？
 类型：可回答
 预期答案：共汇集 123,984 次 MRI 扫描，来自 101,457 名受试者，年龄从受孕后 115 天到 100 岁。
-预期来源：bethlehem2022-brain-charts.pdf p.1
+预期来源：2022-bethlehem-brain-charts.pdf p.1
 
 ### Q02
 问题：总皮层灰质体积（GMV）在几岁达到峰值？
 类型：可回答
 预期答案：总皮层灰质体积在 5.9 岁达到峰值（95% 置信区间 5.8–6.1 岁），之后近似线性下降。
-预期来源：bethlehem2022-brain-charts.pdf p.3、p.5
+预期来源：2022-bethlehem-brain-charts.pdf p.3、p.5
 
 ### Q03
 问题：总白质体积（WMV）在几岁达到峰值，之后如何变化？
 类型：可回答
 预期答案：总白质体积在 28.7 岁达到峰值（95% 置信区间 28.1–29.2 岁），50 岁后加速下降。
-预期来源：bethlehem2022-brain-charts.pdf p.3
+预期来源：2022-bethlehem-brain-charts.pdf p.3
 
 ### Q04
 问题：用横断面脑图谱推算的年龄相关脑变化率，与纵向实测相比会怎样？
 类型：可回答
 预期答案：横断面推算会显著低估纵向实测的变化率；皮层厚度低估最多达 44%（60 岁时），其次是表面积 37%（72 岁）、各向异性分数 FA 35%（73 岁）、灰质体积 26%（73 岁）。
-预期来源：dibiase2023-mapping-brain-charts.pdf p.2
+预期来源：2023-dibiase-mapping-brain-charts.pdf p.2
 
 ### Q05
 问题：Di Biase 2023 研究用了哪两个队列，样本量和年龄范围各是多少？
 类型：可回答
 预期答案：老年队列来自 UK Biobank，基线年龄 47–80 岁，样本量约 2752–2832 人；发育队列来自 ABCD 研究，基线年龄 9–11 岁，样本量约 6537–7480 人。
-预期来源：dibiase2023-mapping-brain-charts.pdf p.2
+预期来源：2023-dibiase-mapping-brain-charts.pdf p.2
 
 ### Q06
 问题：用横断面群体变化率预测个体脑变化，效果比“假设无变化”的朴素预测好多少？
 类型：可回答
 预期答案：只好一点：预测误差降低表面积 18%、灰质体积 7%、各向异性分数 FA 4%、皮层厚度 2%，说明群体水平的变化率很难预测个体轨迹。
-预期来源：dibiase2023-mapping-brain-charts.pdf p.3
+预期来源：2023-dibiase-mapping-brain-charts.pdf p.3
 
 ### Q07
 问题：Fujita 2023 研究纳入多少名认知正常者，随访多久，总访视多少次？
 类型：可回答
 预期答案：纳入 653 名认知正常者，平均随访 11.5 年，总访视 7915 次。
-预期来源：fujita2023-brain-volume-aging.pdf p.1、p.4
+预期来源：2023-fujita-brain-volume-aging.pdf p.1、p.4
 
 ### Q08
 问题：健康老年人全脑体积年均变化率是多少，不同年龄段有何差异？
 类型：可回答
 预期答案：全脑体积年均下降 0.4%，40 多岁约 0.3%/年，80 多岁约 0.5%/年，随年龄加速。
-预期来源：fujita2023-brain-volume-aging.pdf p.4、p.8
+预期来源：2023-fujita-brain-volume-aging.pdf p.4、p.8
 
 ### Q09
 问题：健康老年人脑室体积年均变化率是多少？
 类型：可回答
 预期答案：脑室体积年均增加 1.8%，40 多岁约 1.0%/年，80 多岁约 2.5%/年。
-预期来源：fujita2023-brain-volume-aging.pdf p.4、p.8
+预期来源：2023-fujita-brain-volume-aging.pdf p.4、p.8
 
 ### Q10
 问题：哪个脑叶的萎缩在 70 岁左右加速，在此之前哪个结构先加速？
 类型：可回答
 预期答案：颞叶萎缩率约从 70 岁起加速，在此之前海马和杏仁核先加速。
-预期来源：fujita2023-brain-volume-aging.pdf p.1、p.9
+预期来源：2023-fujita-brain-volume-aging.pdf p.1、p.9
 
 ### Q11
 问题：Ge 2024 的 CentileBrain 研究纳入多少健康人、多少数据集，年龄范围多大？
 类型：可回答
 预期答案：纳入 37,407 名健康人，来自 87 个数据集，年龄 3–90 岁。
-预期来源：ge2024-centilebrain.pdf p.1
+预期来源：2024-ge-centilebrain.pdf p.1
 
 ### Q12
 问题：CentileBrain 比较了 8 种算法后，哪种算法被选为最优？
 类型：可回答
 预期答案：多变量分数多项式回归（MFPR）被选为最优，年龄用非线性多项式、全局脑指标用线性协变量。
-预期来源：ge2024-centilebrain.pdf p.1
+预期来源：2024-ge-centilebrain.pdf p.1
 
 ### Q13
 问题：CentileBrain 的 MFPR 模型性能在样本量超过多少后趋于平稳？
 类型：可回答
 预期答案：样本量超过 3000 人后，模型性能趋于平稳。
-预期来源：ge2024-centilebrain.pdf p.1
+预期来源：2024-ge-centilebrain.pdf p.1
 
 ### Q14
 问题：Seidel 2026 的 B-Norm 和 C-Norm 预测随访皮层厚度时，输入有什么不同？
 类型：可回答
 预期答案：B-Norm 用基线皮层厚度、基线年龄和随访年龄来预测随访厚度；C-Norm 只用年龄。
-预期来源：seidel2026-baseline-cortical-thickness.pdf p.1、p.2
+预期来源：2026-seidel-baseline-cortical-thickness.pdf p.1、p.2
 
 ### Q15
 问题：B-Norm 相比 C-Norm 有什么优势？
 类型：可回答
 预期答案：B-Norm 预测更准确，对青春期发育更敏感：4 个脑区在 B-Norm 下与青春期变化相关，而在 C-Norm 下没有。
-预期来源：seidel2026-baseline-cortical-thickness.pdf p.2
+预期来源：2026-seidel-baseline-cortical-thickness.pdf p.2
 
 ## 应拒答题（5 道）
 
