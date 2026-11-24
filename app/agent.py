@@ -90,6 +90,18 @@ def _build_graph():
     return graph.compile()
 
 
+def _dedupe_citations(chunks: List[dict]) -> List[dict]:
+    """同一论文同一页只显示一次：多个片段可能来自同一页，引用列表按 (source, page) 去重。"""
+    seen = set()
+    out = []
+    for c in chunks:
+        key = (str(c.get("source", "未知")), str(c.get("page", "?")))
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
+
+
 def run(query: str) -> dict:
     try:
         result = _build_graph().invoke(
@@ -106,5 +118,5 @@ def run(query: str) -> dict:
     return {
         "answer": result.get("final", REFUSAL),
         "verified": result.get("verified", False),
-        "citations": result.get("chunks", []),
+        "citations": _dedupe_citations(result.get("chunks", [])),
     }
