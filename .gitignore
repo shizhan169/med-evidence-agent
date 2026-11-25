@@ -4,5 +4,9 @@ __pycache__/
 data/chroma/
 data/checkpoints.db
 data/chunks_preview.json
+eval/results.json
+eval/results.md
+eval/results_prev.json
+eval/results_compare.md
 .venv/
 models/  # 本地下载的 embedding 模型（约 90MB），不进仓库
