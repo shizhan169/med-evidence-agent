@@ -6,7 +6,9 @@ from .config import LLM_BASE_URL, LLM_MODEL, get_api_key
 
 REFUSAL = "根据现有文献无法回答。"
 
-CITE_RE = re.compile(r"\[来源：(.+?) p\.(.+?)\]")
+# 匹配所有 “论文名.pdf p.页码” 形式的引用，包括用分号并在一个括号里的多个引用；
+# “来源：” 前缀不计入文件名，否则和检索片段的 source 对不上
+CITE_RE = re.compile(r"(?:\[?来源：)?([^\s\[\]；,：]+\.pdf)\s+p\.(\d+)")
 
 
 class State(TypedDict):
@@ -20,7 +22,7 @@ class State(TypedDict):
 def retriever_node(state: State):
     from .rag import retrieve
 
-    chunks = retrieve(state["query"], top_k=5)
+    chunks = retrieve(state["query"], top_k=10)
     return {"chunks": chunks}
 
 
