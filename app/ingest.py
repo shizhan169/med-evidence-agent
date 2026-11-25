@@ -148,6 +148,118 @@ def _chunk_context(source: str, page: int, section: str) -> str:
     return f"【文献：{_paper_title(source)}｜第 {page} 页｜{section}】"
 
 
+# 图注识别（图注入库用）：图注行以 Fig./Figure/Table + 数字开头。
+# 真图注后面跟描述性文字；正文里的引用句（Figure 2 shows...）编号后
+# 直接跟动词，不是图注；只有编号、后面没描述的残行也不要。
+# 实测（2026-11-25，26 篇）：这套规则提到 147 条图注、28 条表注；
+# 只有 Kia 2022 一条都没有。方案稿里的 154/30 是另一套较松的口径
+# （把正文引用句也算了进去），以这里实测的 147/28 为准。
+_CAPTION_LABEL_RE = re.compile(
+    r"^\s*(Fig\.|Figure|Table)\s+(\d+[A-Za-z]?)\s*[.:|]?\s*(.*)$", re.IGNORECASE
+)
+_CAPTION_VERBS = (
+    "shows", "showed", "show", "presents", "presented", "illustrates", "illustrate",
+    "demonstrates", "demonstrate", "depicts", "depict", "summarizes", "summarise",
+    "compares", "compare", "plots", "plot", "displays", "display", "reports", "report",
+    "describes", "describe", "lists", "list", "gives", "give", "provides", "provide",
+)
+_CAPTION_VERB_RE = re.compile(r"^(" + "|".join(_CAPTION_VERBS) + r")\b", re.IGNORECASE)
+
+
+def _looks_like_sentence(line: str) -> bool:
+    """续行像不像正经句子：够长、字母占多数、有 4 字母以上的词。
+    图里的坐标轴残行（"40100Age group, y60"、"50"、"-1.5 -0.5 0.5"）
+    字母少或太短，过不了这关。"""
+    s = (line or "").strip()
+    if len(s) < 20:
+        return False
+    alpha = sum(c.isalpha() for c in s)
+    if alpha / len(s) < 0.7:
+        return False
+    return bool(re.search(r"[A-Za-z]{4,}", s))
+
+
+def _extract_captions(raw_text: str) -> list:
+    """从一页原文里提图注/表注，返回 [(kind, number, caption_text, 行首偏移)]，
+    kind 是 "Figure" 或 "Table"。图注可能跨行：标签行后面的描述行
+    最多再接 3 行、总共不超过 600 字，续行必须像句子（见上）。
+    正文引用句和只有编号的残行不要。"""
+    lines = (raw_text or "").splitlines()
+    out = []
+    offset = 0
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        line_start = offset
+        offset += len(line) + 1  # +1 是换行符，近似偏移即可
+        m = _CAPTION_LABEL_RE.match(line)
+        i += 1
+        if not m:
+            continue
+        rest = (m.group(3) or "").strip()
+        if rest and _CAPTION_VERB_RE.match(rest):
+            continue  # 正文引用句，如 Figure 2 shows...
+        parts = [rest] if rest else []
+        n_cont = 0
+        while i < len(lines) and n_cont < 3 and sum(len(p) for p in parts) < 600:
+            nxt = lines[i].strip()
+            if not nxt or _CAPTION_LABEL_RE.match(lines[i]):
+                break
+            if not _looks_like_sentence(nxt):
+                break
+            parts.append(nxt)
+            n_cont += 1
+            offset += len(lines[i]) + 1  # 续行也要算进偏移，不然之后图注的 chunk_start 会偏小
+            i += 1
+        text = " ".join(parts).strip()
+        if not text:
+            continue  # 只有编号的残行
+        kind = "Table" if m.group(1).lower().startswith("table") else "Figure"
+        out.append((kind, m.group(2), f"{kind} {m.group(2)}. {text}", line_start))
+    return out
+
+
+_LABEL_PREFIX_RE = re.compile(r"^(Figure|Table) \d+[A-Za-z]?\. ")
+
+
+def _pack_caption(text: str, page: dict, context: str, start_offset: int) -> list:
+    """图注打包成片段：一般图注只有 100~400 字，走单片段；超长（>800 字）
+    才按句子打包，和正文切分同一套规则。每个片段都带 type=caption，
+    chunk_start 是图注在页内原文里的偏移（ID 唯一性靠页内序号兜底）。
+    长图注打包时标签（"Figure 9."）只留在第一片：分句会把 "Figure 9."
+    切成独立短句，不先剥掉标签、它自己成一片会被长度过滤丢掉。"""
+    base = {**page, "context": context, "type": "caption"}
+    if len(text) <= CHUNK_SIZE:
+        return [{**base, "text": text, "chunk_start": start_offset}]
+    m = _LABEL_PREFIX_RE.match(text)
+    label = m.group(0) if m else ""
+    body = text[len(label):]
+    units = []
+    for sent, start in _split_sentences(body):
+        if len(sent) > CHUNK_SIZE:
+            units.extend(_split_long_sentence(sent, start))
+        else:
+            units.append((sent, start))
+    out, cur, cur_len, cur_start = [], [], 0, None
+    for sent, start in units:
+        if cur and cur_len + 1 + len(sent) > CHUNK_SIZE:
+            piece = " ".join(cur)
+            out.append({**base,
+                        "text": (label + piece) if not out else piece,
+                        "chunk_start": start_offset + len(label) + (cur_start or 0)})
+            cur, cur_len, cur_start = [], 0, None
+        if cur_start is None:
+            cur_start = start
+        cur.append(sent)
+        cur_len += len(sent) + 1
+    if cur:
+        piece = " ".join(cur)
+        out.append({**base,
+                    "text": (label + piece) if not out else piece,
+                    "chunk_start": start_offset + len(label) + (cur_start or 0)})
+    return out
+
+
 def chunk_pages(pages):
     """按句子打包切分：句子是最小单位，不拆句子；相邻片段重叠 1~2 句。
 
@@ -164,6 +276,11 @@ def chunk_pages(pages):
     上一页的章节；第 1 页默认“标题与摘要”（多数论文第 1 页是标题 + 摘要，
     没有 Abstract 标题行）。单页单标签是近似的：跨章节的页面后半部分
     会被标成前半部分的章节，对检索是够用的提示，不是精确的章节标注。
+
+    图注/表注也在这里提（见 _extract_captions）：每条图注单独成一个
+    type=caption 的片段，和正文片段一起返回，一起入库。图注文本在正文
+    片段里也出现过，这里是多存一份带类型标签的版本，问“图 3 讲什么”
+    时检索能直接命中图注。
     """
     chunks = []
     section = "标题与摘要"  # 跨页沿用：第 1 页默认标题与摘要
@@ -200,9 +317,15 @@ def chunk_pages(pages):
             cur_len += len(sent) + 1
         if cur:
             chunks.append({**p, "text": " ".join(s for s, _ in cur), "chunk_start": cur_start, "context": context})
+        # 图注/表注：和正文片段一起入库，metadata 多标 type=caption；
+        # 引用格式不变，还是按页码引。图注文本也在正文片段里出现过一次，
+        # 这里是单独再存一份带类型标签的版本，检索时能直接命中图注。
+        for kind, num, cap_text, cap_off in _extract_captions(p["text"]):
+            chunks.extend(_pack_caption(cap_text, p, context, cap_off))
         section = page_section
-    # 过短片段（<50 字）跳过，和原来一样
-    return [c for c in chunks if len(c["text"]) >= 50]
+    # 过短片段跳过：正文 <50 字不要；图注是已验证的描述性文字，>=20 字就留
+    return [c for c in chunks
+            if len(c["text"]) >= (20 if c.get("type") == "caption" else 50)]
 
 
 def main():

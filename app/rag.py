@@ -10,9 +10,20 @@ CentileBrain、123,984 等）。BM25 是标准算法（词频 + 逆文档频率�
 """
 import re
 
-from .config import CHROMA_DIR, EMBED_MODEL
+from .config import CHROMA_DIR, EMBED_MODEL, RERANKER_MODEL
 
 COLLECTION = "medevidence"
+
+# 重排：混合检索先拿一个更大的候选池（向量 15 + BM25 15），cross-encoder
+# 再按问题相关性打分，取前 5 给回答员。候选池必须比 5+5 大——重排只能给
+# 池子里的片段提名次，不能把池子外的捞进来。池子定 15+15 是实测出来的：
+# Q01 的目标片段 BM25 原来排第 6，加图注后图注片段短、BM25 占优，
+# 目标片段掉到第 11 名——池子不到 11，重排根本见不到它。这是方案稿里
+# “拿 10 个片段重排”的必要修正：池子 30 个、重排后取 5 个。
+# 重排模型不可用（没下载、没装 sentence-transformers）时退回旧行为：
+# 向量 5 + BM25 5，不重排，检索不断。
+RERANK_POOL_PER_SIDE = 15
+RERANK_TOP_K = 5
 
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]*|\d+(?:\.\d+)?")
 _STOPWORDS = {
@@ -137,6 +148,48 @@ def _keyword_chunks(collection, tokens: list, limit: int = 5, exclude_ids=None) 
 
 _embedding_fn = None
 
+# 重排模型单例：None 表示还没试过加载，False 表示加载失败（不要每次检索都重试），
+# 其他值就是加载好的 CrossEncoder。加载失败不抛异常——检索退回旧行为。
+_reranker = None
+
+
+def _get_reranker():
+    """懒加载 cross-encoder 重排模型（本地跑，不调 API）。
+    模型不存在、没装 sentence-transformers、加载失败，都返回 None，
+    调用方退回不重排的旧行为。"""
+    global _reranker
+    if _reranker is not None:
+        return _reranker if _reranker is not False else None
+    try:
+        from sentence_transformers import CrossEncoder
+
+        _reranker = CrossEncoder(RERANKER_MODEL)
+    except Exception as e:
+        print(f"[rerank] 重排模型不可用（{e}），退回不重排："
+              f"请用 ModelScope 下模型到 {RERANKER_MODEL}")
+        _reranker = False
+        return None
+    return _reranker
+
+
+def _rerank(query: str, chunks: list, top_k: int = RERANK_TOP_K) -> list:
+    """cross-encoder 重排：把 (问题, 片段) 一对对喂给模型打相关性分，
+    按分从高到低取前 top_k 个。bi-encoder（向量检索）只看问题和片段
+    各自的向量，重排是让模型同时看问题和片段全文再打分，所以更准——
+    代价是慢，只能对几十个候选片段用，不能对全库用。"""
+    if not chunks:
+        return []
+    reranker = _get_reranker()
+    if reranker is None:
+        return chunks
+    try:
+        scores = reranker.predict([(query, c["text"]) for c in chunks])
+    except Exception as e:
+        print(f"[rerank] 打分失败（{e}），用原顺序返回")
+        return chunks
+    ranked = sorted(range(len(chunks)), key=lambda i: -float(scores[i]))
+    return [chunks[i] for i in ranked[:top_k]]
+
 
 def get_embedding_function():
     """懒加载 embedding，避免 import 时就下载模型。"""
@@ -208,6 +261,8 @@ def add_chunks(chunks: list, batch_size: int = 500) -> int:
             "source": c.get("source", "未知"),
             "page": int(c.get("page", 0)),
             "chunk_start": int(c.get("chunk_start", 0)),
+            # type 区分正文和图注/表注（caption），默认 text；检索时可用它过滤
+            "type": c.get("type", "text"),
         }
         for c in chunks
     ]
@@ -227,19 +282,26 @@ def format_citation(chunk: dict) -> str:
 
 
 def retrieve(query: str, top_k: int = 10):
-    """混合检索：向量和关键词各占一半名额（默认各 5 个），保证关键词的片段
+    """混合检索：向量和关键词各占一半名额，保证关键词的片段
     一定能进最终结果。库为空返回 []，走拒答分支；不要编造片段。
 
     注意：不要先拿满 top_k 个向量结果再往后追加关键词——追加的部分会被
     [:top_k] 截掉，关键词兜底等于没跑（2026-11-25 第二轮评测踩过这个坑）。
-    """
+
+    有重排模型时：候选池放宽到向量 15 + BM25 15（共 30 个），重排后取
+    前 RERANK_TOP_K（5）个给回答员；没有重排模型时保持旧行为
+    （向量 5 + BM25 5，不重排）。"""
     try:
         collection = get_collection()
     except Exception as e:
         print(f"[retrieve] Chroma 不可用：{e}")
         return []
-    vector_k = top_k // 2
-    keyword_k = top_k - vector_k
+    use_rerank = _get_reranker() is not None
+    if use_rerank:
+        vector_k = keyword_k = RERANK_POOL_PER_SIDE
+    else:
+        vector_k = top_k // 2
+        keyword_k = top_k - vector_k
     chunks = []
     seen_ids = set()
     try:
@@ -257,6 +319,8 @@ def retrieve(query: str, top_k: int = 10):
     # 关键词兜底：补向量漏掉的含论文名 / 术语 / 数字的片段，有固定名额
     tokens = _query_tokens(query)
     chunks.extend(_keyword_chunks(collection, tokens, limit=keyword_k, exclude_ids=seen_ids))
+    if use_rerank:
+        return _rerank(query, chunks)
     return chunks[:top_k]
 
 
