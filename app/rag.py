@@ -160,24 +160,49 @@ def get_collection():
     )
 
 
-def add_chunks(chunks: list) -> int:
-    """把 ingest 切好的片段入库。去重：同一 source+page+chunk_start 只存一次。"""
+def _chunk_ids(chunks: list) -> list:
+    """给每个片段一个稳定唯一的入库 ID。
+
+    只用 source-page-chunk_start 不够：按句子切分时，相邻片段会重叠——
+    上一个片段如果只有一个句子，下一个片段会从同一句开头，
+    两个片段的 chunk_start 相同，Chroma 整批 upsert 直接报 DuplicateIDError、
+    一个片段都写不进去（2026-11-25 第四轮评测 0/20 就是这么来的：85 个重复 ID，
+    4220 个片段全没入库，库是空的，评测 20 道题全拒答）。页内序号 k 保证唯一；
+    同一份数据重复入库时 ID 不变，upsert 仍能按 ID 去重覆盖。
+    """
+    per_page = {}
+    ids = []
+    for c in chunks:
+        key = (c.get("source", "unknown"), c.get("page", "?"))
+        k = per_page.get(key, 0)
+        per_page[key] = k + 1
+        ids.append(f"{c.get('source', 'unknown')}-{c.get('page', '?')}-{c.get('chunk_start', 0)}-{k}")
+    return ids
+
+
+def add_chunks(chunks: list, batch_size: int = 500) -> int:
+    """把 ingest 切好的片段入库。分批 upsert：一批出问题不会把整库
+    4220 个片段全拖下水；同一 source+page+chunk_start+页内序号只存一次。"""
     if not chunks:
         return 0
     collection = get_collection()
-    ids, docs, metas = [], [], []
-    for c in chunks:
-        cid = f"{c.get('source', 'unknown')}-{c.get('page', '?')}-{c.get('chunk_start', 0)}"
-        ids.append(cid)
-        docs.append(c["text"])
-        metas.append(
-            {
-                "source": c.get("source", "未知"),
-                "page": int(c.get("page", 0)),
-                "chunk_start": int(c.get("chunk_start", 0)),
-            }
+    ids = _chunk_ids(chunks)
+    docs = [c["text"] for c in chunks]
+    metas = [
+        {
+            "source": c.get("source", "未知"),
+            "page": int(c.get("page", 0)),
+            "chunk_start": int(c.get("chunk_start", 0)),
+        }
+        for c in chunks
+    ]
+    for i in range(0, len(ids), batch_size):
+        collection.upsert(
+            ids=ids[i:i + batch_size],
+            documents=docs[i:i + batch_size],
+            metadatas=metas[i:i + batch_size],
         )
-    collection.upsert(ids=ids, documents=docs, metadatas=metas)
+        print(f"[add_chunks] 已入库 {min(i + batch_size, len(ids))}/{len(ids)} 个片段")
     return len(ids)
 
 

@@ -96,3 +96,11 @@ MedEvidence Agent 从 0 到 1 过程中遇到的真实工程问题。每个问�
 - **原因**：LangGraph 的 State 里只有 query/chunks/draft/final/verified，没有对话历史；FastAPI 的 POST /ask 只收 query；Streamlit 问完就丢，没有把历史传回去。
 - **怎么改的**：① `app/agent.py`：State 加 `history`（最近 6 轮，一轮一问一答）和 `retrieval_query`；`_normalize_history` 清洗历史（只要 user/assistant、去空、留最近 6 轮、总字数超 4000 就从最早一轮开始丢）；`_build_retrieval_query`：问题里有指代词（那/它/这个/那个/呢）且有历史时，把上一轮用户问题拼在前面再检索，普通问题原样返回；`run(query, history=None)`，不传 history 就是原来的单轮行为。② `app/rag.py`：`build_prompt` 加 `history` 参数，历史只用来理解指代，并加规则“引用只能来自本次提供的文献片段，不要引用历史里的页码”（历史里的引用可能不在本次检索结果里，核查员会判错）。③ `app/main.py`：`POST /ask` 接受可选的 `history` 字段。④ `app/streamlit_app.py`：历史存 `st.session_state`，每轮问答后追加，带“清空对话”按钮。⑤ 新增 `tests/test_multiturn.py`（8 个测试，不需要 LLM/Chroma/联网）。
 - **提效**：测试 8/8 通过：历史截断（10 轮→留 6 轮）、脏数据清洗、字数上限、追问改写（“那白质呢？”拼上上文）、单轮行为不变、prompt 含历史、假 LLM + 假检索端到端（追问答对、核查通过）；FastAPI 实测：带 history 和不带 history 的 POST /ask 都返回 200，向后兼容。真的多轮问答效果（追问答对率）要等用户本地跑完整评测/手动试。
+
+## 11. 入库崩了：DuplicateIDError，4220 个片段一个都没写进去，评测 0/20（2026-11-25，已修复）
+
+- **开始的效果**：按句子切分 + 多轮对话改完后，用户本地重跑评测，20 道题全拒答，引用准确率 0.0%（0/0），只用了 27.9 秒。
+- **遇到的问题**：看 results.json，20 道题的引用列表全是空的——检索一个片段都没返回，LLM 一次都没调。用户重跑入库才看到真正的报错：`chromadb.errors.DuplicateIDError: Expected IDs to be unique, found 85 duplicated IDs`，入库在 `collection.upsert` 那一步直接崩了，4220 个片段一个都没写进去，库是空的。
+- **原因**：入库 ID 是 `{论文名}-{页码}-{chunk_start}`，而按句子切分有个新情况：相邻片段会重叠——上一个片段如果只有一个句子（比如一页的第一个句子特别长、700 字，自己占了一个片段），下一个片段会从同一句开头，两个片段的 `chunk_start` 完全相同，ID 就撞了。旧的网格切分是按固定步长 700 推进，`chunk_start` 永远是 0、700、1400……不会撞；新切分一换就撞了 85 个。更糟的是 `add_chunks` 是一次性 upsert 4220 个，校验失败就整批作废，一个都不写；而且 `retrieve()` 在库为空时静默返回空列表、不报错，评测看着“一切正常”，只是全拒答。
+- **怎么改的**：① `app/rag.py` 加 `_chunk_ids`：ID 改成 `{论文名}-{页码}-{chunk_start}-{页内序号}`，同一页里第几个片段就标几，同一个 `chunk_start` 也不会撞；同一份数据重复入库时 ID 不变，upsert 仍能按 ID 去重覆盖。② `add_chunks` 改成分批 upsert（每批 500 个），一批出问题不会把整库拖下水。③ 新增 `tests/test_ingest_ids.py`：合成用例复现单句片段的 `chunk_start` 重复，断言 ID 唯一；真实文献全量检查（26 篇 4220 个片段）断言 ID 唯一。
+- **提效**：本地复现确认 85 个重复 ID（和用户报错的数字一致），修完后测试 10/10 通过（新测试 2 个 + 多轮测试 8 个），真实文献 4220 个片段 ID 全唯一。用户本地重跑入库 + 评测后填数字。教训：入库 ID 必须保证唯一，不能拿“位置”当 ID——位置会重复；批量写入要分批，别让一次校验失败清空整库；检索返回空时要能看出来，别静默拒答。
