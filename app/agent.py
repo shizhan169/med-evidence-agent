@@ -21,6 +21,9 @@ class State(TypedDict):
     # retrieval_query 是真正拿去检索的问题（追问会被拼上上文，见 _build_retrieval_query）
     history: List[dict]
     retrieval_query: str
+    # 核查重试：retries 是已重试次数，retry 是核查员要求再答一次的标志
+    retries: int
+    retry: bool
 
 
 # 多轮对话：历史保留最近 6 轮（一轮 = 一问一答），总字数不超过 4000 字，
@@ -31,6 +34,18 @@ MAX_HISTORY_CHARS = 4000
 # 追问标志词：问题里有这些词、又有历史时，说明它在指代上文（比如“那白质呢？”），
 # 检索时要带上上一轮的问题，否则光凭“那白质呢”几个字检索不到白质体积的片段。
 FOLLOWUP_MARKERS = ("那", "它", "这个", "那个", "呢")
+
+# 核查重试：核查失败（引用不在检索结果中、或没给引用）后，回答员最多重答
+# MAX_RETRIES 次（总共 1 + MAX_RETRIES 次机会），再不过就拒答；只重试回答，
+# 不重新检索——一次只改一个变量。
+MAX_RETRIES = 2
+
+# 重答时的提醒：只准引用本次提供的片段里的页码。
+RETRY_REMINDER = (
+    "\n\n注意：上一次回答的引用没有通过核查（引用了不在检索结果中的页码，"
+    "或没有给出引用）。请只引用本次提供的文献片段里的 [来源：论文名 p.页码]，"
+    "不要自己编页码，不要引用没有提供的页码。"
+)
 
 
 def _normalize_history(history) -> List[dict]:
@@ -99,6 +114,9 @@ def answerer_node(state: State):
     if not state["chunks"]:
         return {"draft": REFUSAL}
     prompt = build_prompt(state["query"], state["chunks"], history=state.get("history") or [])
+    if state.get("retries", 0) > 0:
+        # 重答：提醒模型只引用本次提供的片段，上一轮就是引用错了才回来的
+        prompt = prompt + RETRY_REMINDER
     try:
         draft = _call_llm(prompt)
     except Exception as e:
@@ -114,19 +132,35 @@ def verifier_node(state: State):
     # 核查规则：draft 里的每个 [来源：... p.X] 必须对应一个真实检索片段，否则拒答
     draft = state.get("draft", "")
     if not state.get("chunks") or draft == REFUSAL or draft.startswith("[待接 LLM]"):
+        # 没片段、回答员本来就拒答、LLM 没调通：重试也没用，直接结束
         final = REFUSAL if not state.get("chunks") else draft
-        return {"final": final, "verified": False}
+        return {"final": final, "verified": False, "retry": False}
     cited = set((m.group(1), m.group(2)) for m in CITE_RE.finditer(draft))
     real = set(
         (str(c.get("source", "未知")), str(c.get("page", "?"))) for c in state["chunks"]
     )
-    if not cited:
-        return {"final": REFUSAL, "verified": False}
-    if not cited.issubset(real):
-        bad = sorted(cited - real)
-        print(f"[verifier] 引用不在检索结果中：{bad}")
-        return {"final": REFUSAL, "verified": False}
-    return {"final": draft, "verified": True}
+    if not cited or not cited.issubset(real):
+        # 引用错了（编了页码、或没给引用）：还有重试次数就回回答员重答，
+        # 用完就拒答——绝不编造
+        if not cited:
+            print("[verifier] 回答没有给出引用")
+        else:
+            bad = sorted(cited - real)
+            print(f"[verifier] 引用不在检索结果中：{bad}")
+        retries = state.get("retries", 0)
+        if retries < MAX_RETRIES:
+            return {"final": "", "verified": False, "retry": True, "retries": retries + 1}
+        return {"final": REFUSAL, "verified": False, "retry": False}
+    return {"final": draft, "verified": True, "retry": False}
+
+
+def _route_after_verifier(state: State) -> str:
+    """核查后的走向：通过就结束；要求重试就回回答员；否则结束（拒答）。"""
+    if state.get("verified"):
+        return "end"
+    if state.get("retry"):
+        return "answerer"
+    return "end"
 
 
 def _build_graph():
@@ -139,7 +173,7 @@ def _build_graph():
     graph.set_entry_point("retriever")
     graph.add_edge("retriever", "answerer")
     graph.add_edge("answerer", "verifier")
-    graph.add_edge("verifier", END)
+    graph.add_conditional_edges("verifier", _route_after_verifier, {"answerer": "answerer", "end": END})
     return graph.compile()
 
 
@@ -163,16 +197,20 @@ def run(query: str, history=None) -> dict:
     initial = {
         "query": query, "chunks": [], "draft": "", "final": "", "verified": False,
         "history": history, "retrieval_query": retrieval_query,
+        "retries": 0, "retry": False,
     }
     try:
         result = _build_graph().invoke(initial)
     except Exception as e:
-        # LangGraph 不可用时退回顺序执行，流程本身不变
+        # LangGraph 不可用时退回顺序执行，流程本身不变（重试循环也同步走）
         print(f"[run] LangGraph 不可用，顺序执行：{e}")
         state: State = dict(initial)
         state.update(retriever_node(state))
-        state.update(answerer_node(state))
-        state.update(verifier_node(state))
+        while True:
+            state.update(answerer_node(state))
+            state.update(verifier_node(state))
+            if state.get("verified") or not state.get("retry"):
+                break
         result = state
     return {
         "answer": result.get("final", REFUSAL),
