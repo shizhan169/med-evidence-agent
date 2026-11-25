@@ -2,7 +2,7 @@
 import re
 from typing import TypedDict, List
 
-from .config import LLM_BASE_URL, LLM_MODEL, get_api_key
+from .config import LLM_BASE_URL, LLM_MODEL, get_api_key, tracing_enabled
 
 REFUSAL = "根据现有文献无法回答。"
 
@@ -100,6 +100,16 @@ def _call_llm(prompt: str) -> str:
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key, base_url=LLM_BASE_URL)
+    if tracing_enabled():
+        # LangSmith 追踪开着时，把这次 LLM 调用也记进 trace（能看到 prompt、
+        # 返回、耗时）；langsmith 没装或包不上就用原 client，问答不受影响。
+        # 图本身的执行过程（检索→回答→核查）由 LangChain 的追踪自动记，
+        # 不用这里操心——只要 LANGSMITH_TRACING=true 且装了 langsmith。
+        try:
+            from langsmith.wrappers import wrap_openai
+            client = wrap_openai(client)
+        except Exception:
+            pass
     resp = client.chat.completions.create(
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],

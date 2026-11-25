@@ -13,3 +13,5 @@ openai==1.40.0
 streamlit==1.37.0
 pytest==8.3.0
 httpx==0.27.0
+langsmith==0.1.147  # LangSmith 追踪（只在 LANGSMITH_* 环境变量设置时启用）；0.1.x 才能配 langchain-core 0.2.x（它要求 langsmith<0.2.0），升 langchain-core 时一起升
+langgraph-checkpoint-sqlite==1.0.0  # SQLite checkpointer（会话持久化）；1.0.x 才能配 langgraph 0.2.0 的 langgraph-checkpoint 1.x，升 langgraph 时一起升
