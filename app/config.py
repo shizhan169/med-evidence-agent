@@ -13,6 +13,9 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "./models/bge-m3")
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "./models/bge-reranker-base")
 CHROMA_DIR = os.getenv("CHROMA_DIR", "./data/chroma")
 PAPERS_DIR = os.getenv("PAPERS_DIR", "./data/papers")
+# 会话持久化：LangGraph SQLite checkpointer 的数据库文件（thread_id 的对话存在这里）；
+# 删掉它就是清空所有会话，问答本身不受影响（.gitignore 已排除，不进仓库）
+CHECKPOINTS_DB = os.getenv("CHECKPOINTS_DB", "./data/checkpoints.db")
 
 # 至少要有一个 key 才能跑问答，检索可以先不用 key
 def get_api_key():

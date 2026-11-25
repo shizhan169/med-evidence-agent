@@ -1,4 +1,5 @@
 import json
+import uuid
 
 import streamlit as st
 import httpx
@@ -12,6 +13,11 @@ st.caption("每条结论带来源页码，没有依据就明确拒答。")
 if "history" not in st.session_state:
     st.session_state.history = []
 
+# 会话 id：每个浏览器会话固定一个，后端用它把对话存进 SQLite checkpointer，
+# 服务重启后换个浏览器也不会串；点“清空对话”时换一个新的。
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
+
 # 先显示历史对话
 for msg in st.session_state.history:
     with st.chat_message(msg["role"]):
@@ -23,6 +29,7 @@ ask_clicked = col_ask.button("提问")
 clear_clicked = col_clear.button("清空对话")
 if clear_clicked:
     st.session_state.history = []
+    st.session_state.thread_id = str(uuid.uuid4())
     st.rerun()
 if ask_clicked and query:
     # 流式问答：后端先跑完检索→回答→核查，再把最终答案逐块推回来，
@@ -37,7 +44,8 @@ if ask_clicked and query:
             with httpx.stream(
                 "POST",
                 "http://localhost:8000/ask/stream",
-                json={"query": query, "history": st.session_state.history},
+                json={"query": query, "history": st.session_state.history,
+                      "thread_id": st.session_state.thread_id},
                 timeout=120,
             ) as r:
                 for line in r.iter_lines():

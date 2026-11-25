@@ -9,9 +9,14 @@ app = FastAPI(title="MedEvidence Agent")
 
 class AskRequest(BaseModel):
     query: str
-    # 可选的多轮对话历史：[{"role": "user"/"assistant", "content": "..."}]，
-    # 不传就是单轮问答；传了就按最近 6 轮截断后用
-    history: list = []
+    # 可选的多轮对话历史：[{"role": "user"/"assistant", "content": "..."}]。
+    # 不传（None）且给了 thread_id 时，history 从 checkpointer 里恢复；
+    # 传了（哪怕是 []）就用传来的；不传 thread_id 时就是原来的单轮问答
+    history: list | None = None
+    # 可选的会话 id：传了就用 SQLite checkpointer 把这轮对话存下来，
+    # 下次只传 query + thread_id（history 不传）就能接着聊；
+    # 不传就是原来的无状态问答
+    thread_id: str = ""
 
 class AskResponse(BaseModel):
     answer: str
@@ -24,7 +29,7 @@ def health():
 
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
-    result = run(req.query, history=req.history)
+    result = run(req.query, history=req.history, thread_id=req.thread_id or None)
     return AskResponse(answer=result["answer"], verified=result["verified"], citations=result["citations"])
 
 
@@ -64,7 +69,7 @@ def ask_stream(req: AskRequest):
     """
     def events():
         try:
-            result = run(req.query, history=req.history)
+            result = run(req.query, history=req.history, thread_id=req.thread_id or None)
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
             return

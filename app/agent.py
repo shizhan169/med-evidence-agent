@@ -1,8 +1,9 @@
 """LangGraph 三角色：检索员 -> 回答员 -> 核查员。轻量版多智能体。"""
+import os
 import re
 from typing import TypedDict, List
 
-from .config import LLM_BASE_URL, LLM_MODEL, get_api_key, tracing_enabled
+from .config import CHECKPOINTS_DB, LLM_BASE_URL, LLM_MODEL, get_api_key, tracing_enabled
 
 REFUSAL = "根据现有文献无法回答。"
 
@@ -138,13 +139,24 @@ def answerer_node(state: State):
     return {"draft": draft}
 
 
+def _append_turn_to_history(state: State, final: str) -> List[dict]:
+    """把本轮（一问一答）追加到历史里，供 checkpointer 持久化。
+    只在核查员给出最终答案时调（重试时不调，那轮还没定论）。
+    历史照样只留最近 6 轮、4000 字（_normalize_history 的上限）。"""
+    history = list(state.get("history") or [])
+    history.append({"role": "user", "content": state.get("query", "")})
+    history.append({"role": "assistant", "content": final})
+    return _normalize_history(history)
+
+
 def verifier_node(state: State):
     # 核查规则：draft 里的每个 [来源：... p.X] 必须对应一个真实检索片段，否则拒答
     draft = state.get("draft", "")
     if not state.get("chunks") or draft == REFUSAL or draft.startswith("[待接 LLM]"):
         # 没片段、回答员本来就拒答、LLM 没调通：重试也没用，直接结束
         final = REFUSAL if not state.get("chunks") else draft
-        return {"final": final, "verified": False, "retry": False}
+        return {"final": final, "verified": False, "retry": False,
+                "history": _append_turn_to_history(state, final)}
     cited = set((m.group(1), m.group(2)) for m in CITE_RE.finditer(draft))
     real = set(
         (str(c.get("source", "未知")), str(c.get("page", "?"))) for c in state["chunks"]
@@ -160,8 +172,10 @@ def verifier_node(state: State):
         retries = state.get("retries", 0)
         if retries < MAX_RETRIES:
             return {"final": "", "verified": False, "retry": True, "retries": retries + 1}
-        return {"final": REFUSAL, "verified": False, "retry": False}
-    return {"final": draft, "verified": True, "retry": False}
+        return {"final": REFUSAL, "verified": False, "retry": False,
+                "history": _append_turn_to_history(state, REFUSAL)}
+    return {"final": draft, "verified": True, "retry": False,
+            "history": _append_turn_to_history(state, draft)}
 
 
 def _route_after_verifier(state: State) -> str:
@@ -173,7 +187,40 @@ def _route_after_verifier(state: State) -> str:
     return "end"
 
 
-def _build_graph():
+def _get_checkpointer_cm():
+    """SQLite checkpointer（LangGraph 会话持久化）的上下文管理器，
+    用 with 语句进出（开关数据库连接）。
+    没有 langgraph-checkpoint-sqlite 包时返回 None，图按原来无
+    checkpointer 的方式编译，问答照常、只是不跨重启持久化。
+    from_conn_string 在 0.2 和 1.x 里都是 @contextmanager，用法一样；
+    连接用 check_same_thread=False，服务进程多线程调 run() 也安全。"""
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+    except Exception as e:
+        print(f"[checkpointer] SQLite checkpointer 不可用（{e}），会话不跨重启持久化")
+        return None
+    try:
+        os.makedirs(os.path.dirname(CHECKPOINTS_DB) or ".", exist_ok=True)
+        return SqliteSaver.from_conn_string(CHECKPOINTS_DB)
+    except Exception as e:
+        print(f"[checkpointer] 打开 {CHECKPOINTS_DB} 失败（{e}），会话不跨重启持久化")
+        return None
+
+
+def _restore_history(graph, config) -> List[dict]:
+    """从 checkpointer 里恢复上次保存的对话历史（断点续聊）。
+    没存过、读失败都返回 []，不影响本次问答。"""
+    try:
+        snapshot = graph.get_state(config)
+    except Exception as e:
+        print(f"[checkpointer] 恢复历史失败（{e}），按无历史处理")
+        return []
+    if not snapshot or not snapshot.values:
+        return []
+    return snapshot.values.get("history") or []
+
+
+def _build_graph(checkpointer=None):
     from langgraph.graph import StateGraph, END
 
     graph = StateGraph(State)
@@ -184,7 +231,7 @@ def _build_graph():
     graph.add_edge("retriever", "answerer")
     graph.add_edge("answerer", "verifier")
     graph.add_conditional_edges("verifier", _route_after_verifier, {"answerer": "answerer", "end": END})
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 def _dedupe_citations(chunks: List[dict]) -> List[dict]:
@@ -199,9 +246,29 @@ def _dedupe_citations(chunks: List[dict]) -> List[dict]:
     return out
 
 
-def run(query: str, history=None) -> dict:
-    """问答入口。history 可选，不传就是原来的单轮问答；
-    传了就是多轮：最近 6 轮进 prompt，追问拼上文去检索。"""
+def _to_response(result: dict) -> dict:
+    return {
+        "answer": result.get("final", REFUSAL),
+        "verified": result.get("verified", False),
+        "citations": _dedupe_citations(result.get("chunks", [])),
+    }
+
+
+def _run_sequential(initial: dict) -> dict:
+    """LangGraph 不可用时的顺序执行兜底，流程和图里一致（含重试循环）。"""
+    state: State = dict(initial)
+    state.update(retriever_node(state))
+    while True:
+        state.update(answerer_node(state))
+        state.update(verifier_node(state))
+        if state.get("verified") or not state.get("retry"):
+            break
+    return state
+
+
+def _run_with_graph(query: str, history=None) -> dict:
+    """无持久化的问答路径（原来的 run 逻辑）：建图、invoke，
+    图不可用时退回顺序执行。"""
     history = _normalize_history(history)
     retrieval_query = _build_retrieval_query(query, history)
     initial = {
@@ -212,18 +279,37 @@ def run(query: str, history=None) -> dict:
     try:
         result = _build_graph().invoke(initial)
     except Exception as e:
-        # LangGraph 不可用时退回顺序执行，流程本身不变（重试循环也同步走）
         print(f"[run] LangGraph 不可用，顺序执行：{e}")
-        state: State = dict(initial)
-        state.update(retriever_node(state))
-        while True:
-            state.update(answerer_node(state))
-            state.update(verifier_node(state))
-            if state.get("verified") or not state.get("retry"):
-                break
-        result = state
-    return {
-        "answer": result.get("final", REFUSAL),
-        "verified": result.get("verified", False),
-        "citations": _dedupe_citations(result.get("chunks", [])),
-    }
+        result = _run_sequential(initial)
+    return _to_response(result)
+
+
+def run(query: str, history=None, thread_id=None) -> dict:
+    """问答入口。history 可选，不传就是原来的单轮问答；
+    传了就是多轮：最近 6 轮进 prompt，追问拼上文去检索。
+    thread_id 可选：传了就用 SQLite checkpointer 把这轮对话存下来，
+    下次只传 query + thread_id（history 不传）就能接着聊——history
+    会从 checkpointer 里恢复；不传就是原来的无状态问答。
+    checkpointer 出问题时退回无持久化的图（会话不保存，但问答照常）。"""
+    if thread_id:
+        cm = _get_checkpointer_cm()
+        if cm is not None:
+            try:
+                with cm as checkpointer:
+                    graph = _build_graph(checkpointer)
+                    config = {"configurable": {"thread_id": thread_id}}
+                    if history is None:
+                        # 没传 history：从 checkpointer 里恢复上一轮的
+                        history = _restore_history(graph, config)
+                    history = _normalize_history(history)
+                    retrieval_query = _build_retrieval_query(query, history)
+                    initial = {
+                        "query": query, "chunks": [], "draft": "", "final": "", "verified": False,
+                        "history": history, "retrieval_query": retrieval_query,
+                        "retries": 0, "retry": False,
+                    }
+                    result = graph.invoke(initial, config=config)
+                    return _to_response(result)
+            except Exception as e:
+                print(f"[run] checkpointer 不可用，退回无持久化：{e}")
+    return _run_with_graph(query, history)

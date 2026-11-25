@@ -68,7 +68,7 @@ def test_stream_refusal(monkeypatch):
 
 def test_stream_error_event(monkeypatch):
     """run 抛异常时，流里只有一个 error 事件、没有 token。"""
-    monkeypatch.setattr("app.main.run", lambda query, history=None: (_ for _ in ()).throw(RuntimeError("检索挂了")))
+    monkeypatch.setattr("app.main.run", lambda query, history=None, **kw: (_ for _ in ()).throw(RuntimeError("检索挂了")))
     client = TestClient(app)
     resp = client.post("/ask/stream", json={"query": "总白质体积在几岁达到峰值？"})
     assert resp.status_code == 200
