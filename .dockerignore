@@ -1,0 +1,16 @@
+# 镜像里不装的东西：秘密、本地模型、本地数据库、缓存。
+# 模型和数据运行时挂载（见 README），不进镜像。
+.git
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+models/
+data/chroma/
+data/checkpoints.db
+data/chunks_preview.json
+eval/results.json
+eval/results.md
+eval/results_prev.json
+eval/results_compare.md
