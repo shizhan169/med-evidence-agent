@@ -220,8 +220,24 @@ def retrieve(query: str, top_k: int = 10):
     return chunks[:top_k]
 
 
-def build_prompt(query: str, chunks: list) -> str:
+def build_prompt(query: str, chunks: list, history: list = None) -> str:
+    """拼回答员的 prompt。history 是最近几轮对话
+    [{"role": "user"/"assistant", "content": ...}]，只用来理解追问里的指代
+    （比如“那白质呢”里的“白质”指什么）；回答的依据只能是本次提供的
+    文献片段，不能引用历史里的页码——历史里的引用可能不在本次检索结果里，
+    核查员会按本次片段校验，引用了就会判错。"""
     context = "\n\n".join([f"{c['text']}\n{format_citation(c)}" for c in chunks])
+    history_text = ""
+    if history:
+        lines = []
+        for msg in history:
+            role = "用户" if msg.get("role") == "user" else "助手"
+            lines.append(f"{role}：{msg.get('content', '')}")
+        history_text = (
+            "对话历史（只用来理解追问里的指代，比如“那白质呢”里的“白质”指什么；\n"
+            "回答的引用只能来自下面本次提供的文献片段，不要引用历史里的页码）：\n"
+            + "\n".join(lines) + "\n\n"
+        )
     return f"""你是医学文献问答助手。只根据下面提供的文献片段回答，不要编造。
 
 规则：
@@ -230,7 +246,7 @@ def build_prompt(query: str, chunks: list) -> str:
 3. 用简体中文回答，简洁直接
 4. 每个引用单独写一个括号，不许把多个引用用分号并在一个括号里；一个结论只标一个最相关的引用
 
-文献片段：
+{history_text}文献片段：
 {context}
 
 用户问题：{query}

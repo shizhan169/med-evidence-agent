@@ -17,12 +17,63 @@ class State(TypedDict):
     draft: str
     final: str
     verified: bool
+    # 多轮对话：history 是最近几轮 [{"role": "user"/"assistant", "content": ...}]，
+    # retrieval_query 是真正拿去检索的问题（追问会被拼上上文，见 _build_retrieval_query）
+    history: List[dict]
+    retrieval_query: str
+
+
+# 多轮对话：历史保留最近 6 轮（一轮 = 一问一答），总字数不超过 4000 字，
+# 太长就从最早的一轮开始丢；prompt 太长既费 token、模型也容易抓不住重点。
+MAX_HISTORY_TURNS = 6
+MAX_HISTORY_CHARS = 4000
+
+# 追问标志词：问题里有这些词、又有历史时，说明它在指代上文（比如“那白质呢？”），
+# 检索时要带上上一轮的问题，否则光凭“那白质呢”几个字检索不到白质体积的片段。
+FOLLOWUP_MARKERS = ("那", "它", "这个", "那个", "呢")
+
+
+def _normalize_history(history) -> List[dict]:
+    """把调用方传来的 history 洗成干净的 [{"role", "content"}] 列表。
+    只要 user/assistant 两种角色，空内容丢掉；只保留最近 MAX_HISTORY_TURNS 轮；
+    再按总字数截断，超了就从最早的一轮开始丢。返回的一定是整轮。"""
+    if not history:
+        return []
+    cleaned = []
+    for msg in history:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = (msg.get("content") or "").strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        cleaned.append({"role": role, "content": content})
+    # 只留最近 N 轮；开头如果是 assistant（上一轮的回答没配上问题），丢掉它，保证整轮
+    keep = cleaned[-MAX_HISTORY_TURNS * 2:]
+    if keep and keep[0]["role"] == "assistant":
+        keep = keep[1:]
+    # 总字数超了就从最早的一轮开始丢
+    while len(keep) > 2 and sum(len(m["content"]) for m in keep) > MAX_HISTORY_CHARS:
+        keep = keep[2:]
+    return keep
+
+
+def _build_retrieval_query(query: str, history: List[dict]) -> str:
+    """给检索用的问题。追问（带指代词）就把上一轮用户的问题拼在前面，
+    让检索能看到完整意思；普通问题原样返回，不加东西。"""
+    if history and any(m in query for m in FOLLOWUP_MARKERS):
+        for msg in reversed(history):
+            if msg["role"] == "user":
+                return f"{msg['content']} {query}"
+    return query
 
 
 def retriever_node(state: State):
     from .rag import retrieve
 
-    chunks = retrieve(state["query"], top_k=10)
+    # 追问已经由 _build_retrieval_query 拼好了完整意思，检索用它；
+    # 没历史时 retrieval_query 就是原问题
+    chunks = retrieve(state.get("retrieval_query") or state["query"], top_k=10)
     return {"chunks": chunks}
 
 
@@ -47,7 +98,7 @@ def answerer_node(state: State):
 
     if not state["chunks"]:
         return {"draft": REFUSAL}
-    prompt = build_prompt(state["query"], state["chunks"])
+    prompt = build_prompt(state["query"], state["chunks"], history=state.get("history") or [])
     try:
         draft = _call_llm(prompt)
     except Exception as e:
@@ -104,15 +155,21 @@ def _dedupe_citations(chunks: List[dict]) -> List[dict]:
     return out
 
 
-def run(query: str) -> dict:
+def run(query: str, history=None) -> dict:
+    """问答入口。history 可选，不传就是原来的单轮问答；
+    传了就是多轮：最近 6 轮进 prompt，追问拼上文去检索。"""
+    history = _normalize_history(history)
+    retrieval_query = _build_retrieval_query(query, history)
+    initial = {
+        "query": query, "chunks": [], "draft": "", "final": "", "verified": False,
+        "history": history, "retrieval_query": retrieval_query,
+    }
     try:
-        result = _build_graph().invoke(
-            {"query": query, "chunks": [], "draft": "", "final": "", "verified": False}
-        )
+        result = _build_graph().invoke(initial)
     except Exception as e:
         # LangGraph 不可用时退回顺序执行，流程本身不变
         print(f"[run] LangGraph 不可用，顺序执行：{e}")
-        state: State = {"query": query, "chunks": [], "draft": "", "final": "", "verified": False}
+        state: State = dict(initial)
         state.update(retriever_node(state))
         state.update(answerer_node(state))
         state.update(verifier_node(state))
