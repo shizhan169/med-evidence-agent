@@ -103,6 +103,101 @@ def temp_chroma(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _fujita_p8_text():
+    """真实 Fujita p.8 原文（pypdf）：图 3 标签在第 2 行、正文在第 49–50 行；
+    图 4 标签在第 51 行、正文在第 85–86 行，中间全是坐标轴文字。"""
+    from pathlib import Path
+
+    from app.ingest import parse_pdf
+
+    pdf = Path(__file__).resolve().parents[1] / "data" / "papers" / "2023-fujita-brain-volume-aging.pdf"
+    if not pdf.exists():
+        pytest.skip("data/papers 里没有 Fujita 2023，跳过真实图注检查")
+    pages = parse_pdf(pdf)
+    return pages[7]["text"]
+
+
+def _caption_by_number(caps, kind, number):
+    for k, n, text, _ in caps:
+        if k == kind and n == number:
+            return text
+    raise AssertionError(f"没找到 {kind} {number} 的图注")
+
+
+def test_extract_captions_fujita_p8_recovers_caption_bodies():
+    # pypdf 提的原文里词和词之间常没空格（"Solidblacklines..."），
+    # 所以断言用去空格后的文本，只验图注正文的内容在不在。
+    caps = _extract_captions(_fujita_p8_text())
+    cap3 = _caption_by_number(caps, "Figure", "3")
+    cap4 = _caption_by_number(caps, "Figure", "4")
+    c3, c4 = cap3.replace(" ", ""), cap4.replace(" ", "")
+    assert "Ridgeline" in c3
+    assert "medianvalues" in c3
+    assert "generalizedadditivemodel" in c4
+    assert "95%CIs" in c4
+    # 图 4 的图注不是只有标题（标题约 80 字）
+    assert len(cap4) > 200
+
+
+def test_real_papers_caption_counts_unchanged():
+    # 改动只变图注正文的长度，不变标签识别：26 篇仍是 147 条图注 + 28 条表注。
+    # 跑得慢（约 1 分钟，pypdf 要逐页解析），只在改图注提取后跑。
+    from pathlib import Path
+
+    from app.ingest import parse_pdf
+
+    papers_dir = Path(__file__).resolve().parents[1] / "data" / "papers"
+    pdfs = sorted(papers_dir.glob("*.pdf"))
+    if not pdfs:
+        pytest.skip("data/papers 里没有 PDF，跳过真实文献检查")
+    fig = tab = 0
+    for pdf in pdfs:
+        for p in parse_pdf(pdf):
+            for k, _, _, _ in _extract_captions(p["text"]):
+                if k == "Figure":
+                    fig += 1
+                else:
+                    tab += 1
+    assert (fig, tab) == (147, 28)
+
+
+def test_pack_caption_appends_figure_token_to_context():
+    ctx = "【文献：Test｜第 1 页｜摘要】"
+    page = {"page": 1, "text": "", "source": "test.pdf"}
+    fig = _pack_caption("Figure 4. Some caption text here for testing.", page, ctx, 0)
+    assert fig[0]["context"] == ctx + " figure4"
+    assert fig[0]["context"].startswith("【文献：")
+    tab = _pack_caption("Table 2. Some table caption text here.", page, ctx, 0)
+    assert tab[0]["context"] == ctx + " table2"
+    # 没有标签的文本不加 token
+    plain = _pack_caption("Some caption text without a label.", page, ctx, 0)
+    assert plain[0]["context"] == ctx
+
+
+def test_body_chunks_get_no_figure_token():
+    # 正文里提到 "Figure 4 shows..." 是正文引用句（编号后跟动词），
+    # 不提图注；正文片段的 context 不能带 figure4，不然分不清图 3 正文和图 4 图注。
+    text = (
+        "The study followed a large sample of adults across the lifespan to "
+        "characterize age-dependent changes in brain structure volumes and "
+        "volume change rates over time in this longitudinal analysis. "
+        "Figure 4 shows the volume change rate for each tissue type across age. "
+        "A third sentence adds more detail about the imaging protocol used "
+        "in the study and the analysis plan for the follow-up visits."
+    )
+    chunks = chunk_pages([{"page": 8, "text": text, "source": "2023-fujita-brain-volume-aging.pdf"}])
+    assert chunks
+    assert not any(c.get("type") == "caption" for c in chunks)
+    assert all("figure4" not in c["context"] for c in chunks)
+    assert all("figure" not in c["context"] for c in chunks)
+
+
+def test_strip_context_removes_figure_token():
+    # token 在 context 行上，回答员收到的片段里不能有它
+    ctx = "【文献：Test｜第 1 页｜摘要】 figure4"
+    assert rag._strip_context(ctx + "\n" + "Figure 4. body.") == "Figure 4. body."
+
+
 def test_caption_chunks_roundtrip(temp_chroma):
     page_text = (
         "Introduction sentence about the study design and methods used in this work here. "

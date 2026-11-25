@@ -96,6 +96,77 @@ def _seed_chunks():
             for topic, i in topics]
 
 
+def test_query_tokens_extract_figure_and_table_refs():
+    # "图 4" 拼成 figure4，"图 3" 拼成 figure3，两者不能混
+    q4 = rag._query_tokens("Fujita 2023 的图 4 展示的是什么？")
+    assert "figure4" in q4
+    assert "figure3" not in q4
+    assert "figure3" in rag._query_tokens("Fujita 2023 的图 3 是什么图？")
+    assert "table2" in rag._query_tokens("Table 2 里列了什么？")
+    assert "table2" in rag._query_tokens("表 2 里列了什么？")
+    # 没有图/表引用的问题不带 figure/table token
+    plain = rag._query_tokens("总皮层灰质体积在几岁达到峰值？")
+    assert not [t for t in plain if t.startswith("figure") or t.startswith("table")]
+    # 英文写法也认
+    assert "figure4" in rag._query_tokens("What does Figure 4 show?")
+    assert "figure4" in rag._query_tokens("What does Fig. 4 show?")
+    # _tokenize 本身没动：一位数字仍不进通用分词
+    assert "4" not in rag._tokenize("Fujita 2023 的图 4 展示的是什么？")
+
+
+def test_bm25_prefers_figure4_caption_for_f02():
+    # 不用 Chroma、不用模型：直接用 rank_bm25 给 F02 的查询 token 打分。
+    # 语料按生产 _get_bm25_index 的做法建：文件名 token + 入库文档 token。
+    pytest.importorskip("rank_bm25")
+    from pathlib import Path
+
+    from rank_bm25 import BM25Okapi
+
+    from app.ingest import _extract_captions, _pack_caption, parse_pdf
+
+    pdf = Path(__file__).resolve().parents[1] / "data" / "papers" / "2023-fujita-brain-volume-aging.pdf"
+    if not pdf.exists():
+        pytest.skip("data/papers 里没有 Fujita 2023，跳过 BM25 排序检查")
+    p8 = parse_pdf(pdf)[7]
+    caps = _extract_captions(p8["text"])
+    cap3 = next(t for k, n, t, _ in caps if (k, n) == ("Figure", "3"))
+    cap4 = next(t for k, n, t, _ in caps if (k, n) == ("Figure", "4"))
+    ctx = "【文献：Fujita Brain Volume Aging｜第 8 页｜方法】"
+    page = {"page": 8, "text": p8["text"], "source": "2023-fujita-brain-volume-aging.pdf"}
+    c3 = _pack_caption(cap3, page, ctx, 0)
+    c4 = _pack_caption(cap4, page, ctx, 0)
+    assert len(c3) == 1 and len(c4) == 1  # 两幅图的图注都是单片段
+    # D 片段：图 3 图注正文（正文切分后的样子），不带 figure token
+    d_text = (
+        "Solid black lines indicate the median values. Different colors indicate "
+        "different age groups. The x-axis shows the normalized volume change per "
+        "year as a percentage of the absolute volume of the given structure. Figure 4."
+    )
+    docs = [
+        ("2023-fujita-brain-volume-aging.pdf", c3[0]["context"] + "\n" + c3[0]["text"]),
+        ("2023-fujita-brain-volume-aging.pdf", c4[0]["context"] + "\n" + c4[0]["text"]),
+        ("2023-fujita-brain-volume-aging.pdf", ctx + "\n" + d_text),
+        ("2022-bethlehem-brain-charts.pdf",
+         "【文献：Bethlehem Brain Charts｜第 1 页｜标题与摘要】\n"
+         "The study included 123,984 magnetic resonance imaging scans from 101,457 participants."),
+        ("2024-ge-centilebrain.pdf",
+         "【文献：Ge Centilebrain｜第 1 页｜标题与摘要】\n"
+         "CentileBrain included 37,407 healthy individuals from 87 datasets aged 3–90 years."),
+        ("2026-seidel-baseline-cortical-thickness.pdf",
+         "【文献：Seidel Baseline Cortical Thickness｜第 1 页｜标题与摘要】\n"
+         "B-Norm uses baseline cortical thickness to predict follow-up thickness."),
+    ]
+    corpus = [
+        rag._tokenize(fname.replace("-", " ").replace("_", " ")) + rag._tokenize(doc)
+        for fname, doc in docs
+    ]
+    tokens = rag._query_tokens("Fujita 2023 的图 4 展示的是什么？")
+    assert tokens == ["2023", "figure4", "fujita"]
+    scores = BM25Okapi(corpus).get_scores(tokens)
+    # 图 4 图注是唯一带 figure4 的片段，必须排在图 3 图注和 D 之前
+    assert scores[1] > scores[0] and scores[1] > scores[2]
+
+
 def test_retrieve_uses_reranker_when_available(temp_chroma, monkeypatch):
     rag.add_chunks(_seed_chunks())
     monkeypatch.setattr(rag, "_get_reranker", lambda: _FakeReranker())

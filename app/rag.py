@@ -55,8 +55,18 @@ def _tokenize(text: str) -> list:
 
 
 def _query_tokens(query: str) -> list:
-    """从问题里抽英文词和数字 token（论文名、术语、年份、数字），去停用词。"""
-    return sorted(set(_tokenize(query)))
+    """从问题里抽英文词和数字 token（论文名、术语、年份、数字），去停用词。
+    另外抽图/表引用（"图 4"、"Figure 4"、"Fig. 4"、"表 2"、"Table 2"），
+    拼成 "figure4"/"table2" 这样的 token：入库时图注片段的 context 行末尾
+    带同名 token（见 _pack_caption），BM25 就能按图号区分图 3 和图 4 的
+    图注。只加到 BM25 查询 token 里，向量那一半用原始问题文本，不受影响。
+    不改 _tokenize 本身（它动全局）；一位数字只在这里认，不进通用分词。"""
+    tokens = set(_tokenize(query))
+    for m in re.finditer(r"(?:图|Figure|Fig\.)\s*(\d+)", query or "", re.IGNORECASE):
+        tokens.add(f"figure{m.group(1)}")
+    for m in re.finditer(r"(?:表|Table)\s*(\d+)", query or "", re.IGNORECASE):
+        tokens.add(f"table{m.group(1)}")
+    return sorted(tokens)
 
 
 def _get_bm25_index(collection):

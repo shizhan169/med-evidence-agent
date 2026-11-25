@@ -182,7 +182,15 @@ def _looks_like_sentence(line: str) -> bool:
 def _extract_captions(raw_text: str) -> list:
     """从一页原文里提图注/表注，返回 [(kind, number, caption_text, 行首偏移)]，
     kind 是 "Figure" 或 "Table"。图注可能跨行：标签行后面的描述行
-    最多再接 3 行、总共不超过 600 字，续行必须像句子（见上）。
+    不一定紧挨着——pypdf 提文字时，图的坐标轴文字会插在标签和图注正文
+    之间（Fujita p.8：图 3 的正文在标签往下 47 行，图 4 的在 34 行后），
+    所以遇到空行或非句子行不再停，而是跳过继续往后扫；最多再接 10 行、
+    总共不超过 1000 字，遇到下一个图注/表注标签就停（不消耗它，
+    外层循环还要处理它）。续行必须像句子（见上），坐标轴残行
+    （"40100Age group, y60"）过不了这关；但带结构名的坐标轴行
+    （"Volume change rate, %/y-1.0Whole brainA"）能通过，会混进来——
+    它们不在 F01/F02 的查询里，不影响 BM25 排名，且多半是图里本来就有的
+    面板名/结构名，关键是图注正文必须在里面。
     正文引用句和只有编号的残行不要。"""
     lines = (raw_text or "").splitlines()
     out = []
@@ -201,16 +209,16 @@ def _extract_captions(raw_text: str) -> list:
             continue  # 正文引用句，如 Figure 2 shows...
         parts = [rest] if rest else []
         n_cont = 0
-        while i < len(lines) and n_cont < 3 and sum(len(p) for p in parts) < 600:
+        while i < len(lines) and n_cont < 10 and sum(len(p) for p in parts) < 1000:
+            if _CAPTION_LABEL_RE.match(lines[i]):
+                break  # 下一个图注/表注标签：不消耗它，外层循环处理
             nxt = lines[i].strip()
-            if not nxt or _CAPTION_LABEL_RE.match(lines[i]):
-                break
-            if not _looks_like_sentence(nxt):
-                break
+            offset += len(lines[i]) + 1  # 扫过的行都要算进偏移，跳过的也算
+            i += 1
+            if not nxt or not _looks_like_sentence(nxt):
+                continue  # 空行或坐标轴残行：跳过，继续往后扫
             parts.append(nxt)
             n_cont += 1
-            offset += len(lines[i]) + 1  # 续行也要算进偏移，不然之后图注的 chunk_start 会偏小
-            i += 1
         text = " ".join(parts).strip()
         if not text:
             continue  # 只有编号的残行
@@ -219,7 +227,7 @@ def _extract_captions(raw_text: str) -> list:
     return out
 
 
-_LABEL_PREFIX_RE = re.compile(r"^(Figure|Table) \d+[A-Za-z]?\. ")
+_LABEL_PREFIX_RE = re.compile(r"^(Figure|Table) (\d+)[A-Za-z]?\. ")
 
 
 def _pack_caption(text: str, page: dict, context: str, start_offset: int) -> list:
@@ -227,7 +235,20 @@ def _pack_caption(text: str, page: dict, context: str, start_offset: int) -> lis
     才按句子打包，和正文切分同一套规则。每个片段都带 type=caption，
     chunk_start 是图注在页内原文里的偏移（ID 唯一性靠页内序号兜底）。
     长图注打包时标签（"Figure 9."）只留在第一片：分句会把 "Figure 9."
-    切成独立短句，不先剥掉标签、它自己成一片会被长度过滤丢掉。"""
+    切成独立短句，不先剥掉标签、它自己成一片会被长度过滤丢掉。
+
+    图注片段的 context 行末尾追加一个图号 token（"figure4"/"table2"，
+    只取图注自己标签上的数字）：入库文档是 context + 正文，BM25 索引
+    建在入库文档上，token 会被索引；检索时 _strip_context 剥掉整行
+    context，token 到不了大模型。只给图注片段加——正文片段的 context
+    不动，正文里提到 "Figure 4" 的片段也不加，不然分不清图 3 正文
+    和图 4 图注（D 片段末尾就粘着 "Figure 4."）。"""
+    token = ""
+    m = _LABEL_PREFIX_RE.match(text)
+    if m:
+        token = f"{m.group(1)}{m.group(2)}".lower()
+    if token:
+        context = f"{context} {token}"
     base = {**page, "context": context, "type": "caption"}
     if len(text) <= CHUNK_SIZE:
         return [{**base, "text": text, "chunk_start": start_offset}]
