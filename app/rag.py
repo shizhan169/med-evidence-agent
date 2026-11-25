@@ -1,10 +1,12 @@
 """检索 + 引用格式化。核心规则：没有依据就拒答，引用必须带页码。
 
-检索是混合式：向量检索为主，关键词兜底为辅。
+检索是混合式：向量检索（多语言 embedding）+ 关键词检索（BM25），各占一半名额。
 原因：问题是中文，文献是英文，跨语言向量检索常漏掉含论文名 / 术语 / 数字的
-关键片段；关键词能直接命中这些与语言无关的 token（Bethlehem、MFPR、
-CentileBrain、123,984 等）。向量和关键词各占一半名额，保证关键词的片段
-一定能进最终结果，不会被向量结果挤掉。
+关键片段；BM25 能直接命中这些与语言无关的 token（Bethlehem、MFPR、
+CentileBrain、123,984 等）。BM25 是标准算法（词频 + 逆文档频率加权），
+索引只建一次并缓存，库扩到 1000 篇也能用；不要用“数 token 个数 + 文件名
+加权”这种临时补丁代替它（2026-11-25 复盘：临时补丁每次查询全库扫一遍、
+依赖我方的文件名格式、通用 token 一多就同分，扩展性差）。
 """
 import re
 
@@ -19,27 +21,98 @@ _STOPWORDS = {
     "pdf", "p", "vs", "per", "how", "what", "which", "does", "do",
 }
 
+try:
+    from rank_bm25 import BM25Okapi
+
+    _BM25_AVAILABLE = True
+except Exception:
+    BM25Okapi = None
+    _BM25_AVAILABLE = False
+
+# BM25 索引缓存：建一次，多次复用；库里片段数变了才重建。
+# 注意：重新入库后要重启服务（或重跑评测进程），否则缓存还是旧库的索引。
+_BM25_CACHE = {"count": -1, "index": None, "chunks": None}
+
+
+def _tokenize(text: str) -> list:
+    """把文本切成英文词和数字 token（小写、去停用词），BM25 索引和问题共用。"""
+    return [
+        t.lower()
+        for t in _TOKEN_RE.findall(text or "")
+        if len(t) >= 2 and t.lower() not in _STOPWORDS
+    ]
+
 
 def _query_tokens(query: str) -> list:
     """从问题里抽英文词和数字 token（论文名、术语、年份、数字），去停用词。"""
-    tokens = set()
-    for t in _TOKEN_RE.findall(query):
-        t = t.lower()
-        if len(t) < 2 or t in _STOPWORDS:
-            continue
-        tokens.add(t)
-    return sorted(tokens)
+    return sorted(set(_tokenize(query)))
+
+
+def _get_bm25_index(collection):
+    """建 BM25 索引并缓存。索引文档 = 文件名 token + 正文 token。
+
+    文件名也放进索引：问题里提到的论文名（Bethlehem、Fujita）常出现在
+    文件名里；文件名是原样用还是我方重命名格式，不影响机制本身——
+    原始文件名（如 1-s2.0-...main.pdf）的 token 只是匹配不上，不会出错。
+    """
+    try:
+        count = collection.count()
+    except Exception:
+        count = -1
+    if _BM25_CACHE["index"] is not None and _BM25_CACHE["count"] == count:
+        return _BM25_CACHE["index"], _BM25_CACHE["chunks"]
+    try:
+        data = collection.get(include=["documents", "metadatas"])
+    except Exception as e:
+        print(f"[bm25] 取全库片段失败：{e}")
+        return None, []
+    docs = data.get("documents") or []
+    metas = data.get("metadatas") or []
+    ids = data.get("ids") or []
+    corpus, chunks = [], []
+    for doc, meta, cid in zip(docs, metas, ids):
+        fname = (meta.get("source", "") or "").replace("-", " ").replace("_", " ")
+        corpus.append(_tokenize(fname) + _tokenize(doc))
+        chunks.append(
+            {
+                "text": doc,
+                "source": meta.get("source", "未知"),
+                "page": meta.get("page", "?"),
+                "id": cid,
+            }
+        )
+    if not corpus:
+        return None, []
+    index = BM25Okapi(corpus) if _BM25_AVAILABLE else None
+    _BM25_CACHE.update({"count": count, "index": index, "chunks": chunks})
+    return index, chunks
 
 
 def _keyword_chunks(collection, tokens: list, limit: int = 5, exclude_ids=None) -> list:
-    """关键词兜底：按 token 命中数给全库片段打分，取前 limit 个（跳过向量已召回的）。
+    """关键词检索：BM25 打分取前 limit 个（跳过向量已召回的）。
 
-    打分 = 正文命中数 + 文件名命中数 × 2。文件名加权的原因：问题里提到的
-    论文名（Bethlehem、Fujita、Seidel）就在文件名里，加权后该论文的片段
-    会排在前面，避免被其他论文同分片段按入库顺序挤掉。
+    rank_bm25 没装时退回 token 计数兜底（效果差一截，但不断）。
     """
     if not tokens:
         return []
+    exclude_ids = exclude_ids or set()
+    if _BM25_AVAILABLE:
+        index, chunks = _get_bm25_index(collection)
+        if index is None:
+            return []
+        scores = index.get_scores(tokens)
+        ranked = sorted(range(len(scores)), key=lambda i: -scores[i])
+        out = []
+        for i in ranked:
+            if scores[i] <= 0:
+                break
+            c = chunks[i]
+            if c["id"] in exclude_ids:
+                continue
+            out.append({"text": c["text"], "source": c["source"], "page": c["page"]})
+            if len(out) >= limit:
+                break
+        return out
     try:
         all_data = collection.get(include=["documents", "metadatas"])
     except Exception as e:
@@ -48,15 +121,12 @@ def _keyword_chunks(collection, tokens: list, limit: int = 5, exclude_ids=None) 
     docs = all_data.get("documents") or []
     metas = all_data.get("metadatas") or []
     ids = all_data.get("ids") or []
-    exclude_ids = exclude_ids or set()
     scored = []
     for doc, meta, cid in zip(docs, metas, ids):
         if cid in exclude_ids:
             continue
         text = (doc or "").lower()
-        fname = (meta.get("source", "") or "").lower()
         hits = sum(1 for t in tokens if t in text)
-        hits += 2 * sum(1 for t in tokens if t in fname)
         if hits:
             scored.append((hits, doc, meta))
     scored.sort(key=lambda x: -x[0])
