@@ -41,7 +41,9 @@ QUESTIONS_FILE = ROOT / "eval" / "test_questions.md"
 PAPERS_DIR = ROOT / "data" / "papers"
 
 # 和 eval/run_eval.py 同一套题库格式：### 题号 + “字段：值”行
-BLOCK_RE = re.compile(r"^###\s+(Q\d+|R\d+)\s*$", re.M)
+# 题号含 F/FR（图表题）时也解析，但本工具只分析原 15 道可回答题：
+# 图表题测的是图注检索，不是切分回归，BM25 基线不一样，不混进这里的数字。
+BLOCK_RE = re.compile(r"^###\s+(Q\d+|R\d+|FR\d+|F\d+)\s*$", re.M)
 FIELD_RE = re.compile(r"^(问题|类型|预期答案|预期来源|拒答原因)：(.*)$")
 SOURCE_RE = re.compile(r"^(.+\.pdf)\s+p\.(.+)$")
 
@@ -117,7 +119,9 @@ def _chunk_has(chunk_text: str, needle: str) -> bool:
 
 
 def main() -> int:
-    questions = [q for q in parse_questions(QUESTIONS_FILE) if q["type"] == "可回答"]
+    # 只看原 15 道可回答题：图表题（F/FR）测图注检索，不参与切分回归检查
+    questions = [q for q in parse_questions(QUESTIONS_FILE)
+                 if q["type"] == "可回答" and not q["id"].startswith("F")]
     pdfs = sorted(PAPERS_DIR.glob("*.pdf"))
     print(f"解析 {len(pdfs)} 篇 PDF，对照旧切分和新切分……")
     old_chunks, new_chunks = [], []
