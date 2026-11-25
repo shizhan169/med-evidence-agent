@@ -11,6 +11,12 @@ CentileBrain、123,984 等）。BM25 是标准算法（词频 + 逆文档频率�
 import re
 
 from .config import CHROMA_DIR, EMBED_MODEL, RERANKER_MODEL
+from .prompts import load_prompt
+
+# 回答员的 prompt 模板：存在 prompts/answerer/v1.txt，启动时读进来；
+# 改 prompt 就改那个文件，不用动代码（模板里的 {history_text}、
+# {context}、{query} 是占位符，build_prompt 里填）。
+ANSWERER_TEMPLATE = load_prompt("answerer", "v1")
 
 COLLECTION = "medevidence"
 
@@ -352,16 +358,4 @@ def build_prompt(query: str, chunks: list, history: list = None) -> str:
             "回答的引用只能来自下面本次提供的文献片段，不要引用历史里的页码）：\n"
             + "\n".join(lines) + "\n\n"
         )
-    return f"""你是医学文献问答助手。只根据下面提供的文献片段回答，不要编造。
-
-规则：
-1. 每条关键结论后面必须标注引用，格式 [来源：论文名 p.页码]
-2. 如果文献里没有依据，明确说“根据现有文献无法回答”，不要猜
-3. 用简体中文回答，简洁直接
-4. 每个引用单独写一个括号，不许把多个引用用分号并在一个括号里；一个结论只标一个最相关的引用
-
-{history_text}文献片段：
-{context}
-
-用户问题：{query}
-"""
+    return ANSWERER_TEMPLATE.format(history_text=history_text, context=context, query=query)

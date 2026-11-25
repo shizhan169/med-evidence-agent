@@ -4,6 +4,7 @@ import re
 from typing import TypedDict, List
 
 from .config import CHECKPOINTS_DB, LLM_BASE_URL, LLM_MODEL, get_api_key, tracing_enabled
+from .prompts import load_prompt
 
 REFUSAL = "根据现有文献无法回答。"
 
@@ -42,11 +43,8 @@ FOLLOWUP_MARKERS = ("那", "它", "这个", "那个", "呢")
 MAX_RETRIES = 2
 
 # 重答时的提醒：只准引用本次提供的片段里的页码。
-RETRY_REMINDER = (
-    "\n\n注意：上一次回答的引用没有通过核查（引用了不在检索结果中的页码，"
-    "或没有给出引用）。请只引用本次提供的文献片段里的 [来源：论文名 p.页码]，"
-    "不要自己编页码，不要引用没有提供的页码。"
-)
+# 文本在 prompts/retry/v1.txt，启动时读进来；改提醒就改那个文件。
+RETRY_REMINDER = load_prompt("retry", "v1")
 
 
 def _normalize_history(history) -> List[dict]:
