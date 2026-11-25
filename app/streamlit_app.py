@@ -1,3 +1,5 @@
+import json
+
 import streamlit as st
 import httpx
 
@@ -23,24 +25,47 @@ if clear_clicked:
     st.session_state.history = []
     st.rerun()
 if ask_clicked and query:
-    with st.spinner("正在检索文献..."):
+    # 流式问答：后端先跑完检索→回答→核查，再把最终答案逐块推回来，
+    # 这里一边收一边显示；收完才把本轮写进历史、展示引用。
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        placeholder.write("正在检索文献...")
+        full = ""
+        verified = False
+        citations = []
         try:
-            r = httpx.post(
-                "http://localhost:8000/ask",
+            with httpx.stream(
+                "POST",
+                "http://localhost:8000/ask/stream",
                 json={"query": query, "history": st.session_state.history},
-                timeout=60,
-            )
-            data = r.json()
-            answer = data.get("answer", "")
-            # 先把本轮问答存进历史，下次追问（比如“那白质呢？”）才能接上文
-            st.session_state.history.append({"role": "user", "content": query})
-            st.session_state.history.append({"role": "assistant", "content": answer})
-            st.write(answer)
-            if data.get("citations"):
-                st.subheader("引用")
-                for c in data["citations"]:
-                    st.write(f"- {c.get('source')} p.{c.get('page')}")
-            else:
-                st.info("本次无引用，说明文献库中暂无依据。")
+                timeout=120,
+            ) as r:
+                for line in r.iter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    event = json.loads(line[5:].strip())
+                    if event.get("type") == "token":
+                        full += event.get("text", "")
+                        placeholder.write(full)
+                    elif event.get("type") == "done":
+                        verified = event.get("verified", False)
+                        citations = event.get("citations", [])
+                    elif event.get("type") == "error":
+                        placeholder.write("")
+                        st.error(f"后端出错：{event.get('message', '')}")
+                        full = ""
+                        break
         except Exception as e:
+            placeholder.write("")
             st.error(f"后端未启动，请先跑 uvicorn app.main:app --reload --port 8000。错误：{e}")
+            full = ""
+    if full:
+        # 先把本轮问答存进历史，下次追问（比如“那白质呢？”）才能接上文
+        st.session_state.history.append({"role": "user", "content": query})
+        st.session_state.history.append({"role": "assistant", "content": full})
+        if citations:
+            st.subheader("引用")
+            for c in citations:
+                st.write(f"- {c.get('source')} p.{c.get('page')}")
+        else:
+            st.info("本次无引用，说明文献库中暂无依据。")
