@@ -12,9 +12,12 @@
     eval/results.md    中文总结：总数、已答/拒答、应拒答正确数、引用准确率、逐题表
 
 指标定义：
-    已答 / 拒答：回答是否以“根据现有文献无法回答”开头（不带句号：
-    模型有时用分号、冒号或直接接解释，如“根据现有文献无法回答；……”、
-    “根据现有文献无法回答具体‘快多少’”，这些都是拒答）。
+    已答 / 拒答：回答的第一句里是否出现"无法回答"。
+    不用固定开头匹配：模型有时会在"根据现有文献"和"无法回答"之间
+    插词（如"根据现有文献片段无法回答……"），开头匹配会漏判（第七轮
+    Q09 就是这么漏的）。只看第一句，是因为已答题的后半句也可能出现
+    "无法回答"（如 Q03 第五轮"峰值后至 50 岁前的具体变化，根据现有文献
+    片段无法回答"），那是部分拒答不是整题拒答。
     应拒答答对：应拒答题被正确拒答的题数。
     引用命中：可回答题返回的引用里包含预期来源（论文 + 页码）。
     注意 run() 返回的引用是检索到的片段列表，所以引用命中实际度量的是
@@ -34,7 +37,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from app.agent import REFUSAL, run  # noqa: E402
+from app.agent import run  # noqa: E402
 
 QUESTIONS_FILE = ROOT / "eval" / "test_questions.md"
 RESULTS_JSON = ROOT / "eval" / "results.json"
@@ -85,6 +88,19 @@ def citation_hit(citations: list, expected_file: str, expected_pages: list) -> b
         if c.get("source") == expected_file and int(c.get("page", -1)) in expected_pages:
             return True
     return False
+
+
+def is_refusal(answer: str) -> bool:
+    """答案是不是拒答。
+
+    标志是第一句里出现"无法回答"。不用固定开头匹配：模型有时会在
+    "根据现有文献"和"无法回答"之间插词（如"根据现有文献片段无法回答……"），
+    开头匹配会漏判（第七轮 Q09）。只看第一句，是因为已答题的后半句也
+    可能出现"无法回答"（如 Q03 第五轮"峰值后至 50 岁前的具体变化，根据
+    现有文献片段无法回答"），那是部分拒答不是整题拒答。
+    """
+    first = re.split(r"[。！？；\n]", answer.strip(), maxsplit=1)[0]
+    return "无法回答" in first
 
 
 def section_summary(records: list) -> dict:
@@ -154,7 +170,7 @@ def main():
         except Exception as e:  # 单题失败不中断整轮评测
             answer, verified, citations, error = "", False, [], str(e)
             print(f"    运行出错：{error}")
-        refused = answer.strip().startswith(REFUSAL.rstrip("。"))
+        refused = is_refusal(answer)
         hit = citation_hit(citations, q["expected_file"], q["expected_pages"]) if not refused else False
         records.append({
             "id": q["id"],

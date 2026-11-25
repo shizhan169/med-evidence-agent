@@ -5,7 +5,7 @@
 """
 from pathlib import Path
 
-from eval.run_eval import parse_questions, section_summary
+from eval.run_eval import is_refusal, parse_questions, section_summary
 
 ROOT = Path(__file__).resolve().parent.parent
 QUESTIONS_FILE = ROOT / "eval" / "test_questions.md"
@@ -53,6 +53,21 @@ def test_figure_questions_parse():
         assert q["section"] == "figure", fid
         assert q["refuse_reason"], fid
         assert q["expected_answer"] == ""
+
+
+def test_is_refusal_first_sentence():
+    # 固定开头 "根据现有文献无法回答" 及其变体：第七轮 Q09 在中间插了"片段"，
+    # 旧的 startswith 判定漏判了它
+    assert is_refusal("根据现有文献无法回答。")
+    assert is_refusal("根据现有文献片段无法回答“健康老年人脑室体积年均变化率”的具体数值；片段中的脑室变化率图未给出可读的具体数值。")
+    assert is_refusal("根据现有文献无法回答：提供的片段中仅出现“Lecanemab in early Alzheimer’s disease”这一参考文献题名。")
+    assert is_refusal("根据现有文献无法回答具体“快多少”。片段仅报告 APOE 风险变异 rs429358 与海马体积变化率相关。")
+    assert is_refusal("根据现有文献无法回答“健康老年人全脑体积年均变化率”的具体数值及其不同年龄段差异；片段仅以按年龄组分层的分布图展示全脑体积变化率。")
+    # 正常回答：第一句没有"无法回答"
+    assert not is_refusal("总灰质体积（GMV）在 5.9 岁达到峰值（95% bootstrap CI 5.8–6.1）[来源：2022-bethlehem-brain-charts.pdf p.3]。")
+    # 后半句的部分拒答不是整题拒答（Q03 第五轮的写法）
+    assert not is_refusal("总白质体积（WMV）在 28.7岁达到峰值（95% bootstrap CI 28.1–29.2）。峰值后至 50 岁前的具体变化，根据现有文献片段无法回答。")
+    assert not is_refusal("")
 
 
 def test_section_summary_splits_original_and_figure():
