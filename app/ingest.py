@@ -90,6 +90,64 @@ def _split_long_sentence(sent: str, start: int) -> list:
     return pieces
 
 
+# 章节标题识别（Contextual Retrieval 便宜版用）：只认单独成行的短标题，
+# 如 "Abstract"、"1. Introduction"、"Methods"；正文里顺带提到 results
+# 的长句子不会误判。标签是中文，因为问题是中文，中文标签能帮向量检索
+# 在中文问题和英文正文之间搭桥；BM25 的分词器只认英文数字，中文标签
+# 对它不可见，也不捣乱。
+_SECTION_HEADERS = [
+    (r"abstract", "摘要"),
+    (r"summary", "摘要"),
+    (r"introduction", "引言"),
+    (r"background", "背景"),
+    (r"methods?", "方法"),
+    (r"methodology", "方法"),
+    (r"materials?\s+and\s+methods?", "方法"),
+    (r"results?", "结果"),
+    (r"discussion", "讨论"),
+    (r"conclusions?", "结论"),
+    (r"references?", "参考文献"),
+    (r"acknowledg(e)?ments?", "致谢"),
+]
+_HEADER_LINE_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)*\.?\s*)?([A-Za-z][A-Za-z ]*?)\s*$")
+
+
+def _detect_section_headers(raw_text: str) -> list:
+    """从一页原文里找出章节标题，返回 [(行首偏移, 中文标签)]（按出现顺序）。
+    只认单独成行、且整行就是标题的短行；期刊名、作者行、图注都不会命中。
+    偏移用来判断标题在页首还是页中——见 chunk_pages 里的用法。"""
+    found = []
+    offset = 0
+    for line in (raw_text or "").splitlines():
+        m = _HEADER_LINE_RE.match(line)
+        if m:
+            head = m.group(1).strip().lower()
+            for pat, label in _SECTION_HEADERS:
+                if re.fullmatch(pat, head):
+                    if not found or found[-1][1] != label:
+                        found.append((offset, label))
+                    break
+        offset += len(line) + 1  # +1 是换行符，近似偏移即可
+    return found
+
+
+def _paper_title(source: str) -> str:
+    """从文件名拼一个可读的论文标题，如 2024-ge-centilebrain.pdf -> Ge Centilebrain。
+    只用来做检索上下文，不是引用，不用很精确。"""
+    name = (source or "").removesuffix(".pdf")
+    parts = [t for t in name.split("-") if t]
+    if parts and re.fullmatch(r"\d{4}", parts[0]):
+        parts = parts[1:]
+    return " ".join(t[:1].upper() + t[1:] for t in parts) or (source or "未知论文")
+
+
+def _chunk_context(source: str, page: int, section: str) -> str:
+    """检索用上下文：贴在片段前面一起算 embedding，让检索分得清
+    这是哪篇论文、哪一页、哪个部分（摘要还是方法）。只给检索用，
+    回答时由 retrieve() 剥掉，模型看不到，引用也不变。"""
+    return f"【文献：{_paper_title(source)}｜第 {page} 页｜{section}】"
+
+
 def chunk_pages(pages):
     """按句子打包切分：句子是最小单位，不拆句子；相邻片段重叠 1~2 句。
 
@@ -97,9 +155,24 @@ def chunk_pages(pages):
     新片段开头带上上个片段末尾的句子（攒够约 CHUNK_OVERLAP 字为止），
     这样跨片段的结论和数字不断线。返回的每个片段仍是
     {page, text, source, chunk_start}，和原来一样的形状，下游不用改。
+
+    另外每个片段多带一个 "context" 字段（Contextual Retrieval 便宜版）：
+    论文标题 + 页码 + 章节，只给检索用，不进回答。章节是启发式识别的：
+    一页的章节取该页开头附近（前 1500 字内）第一个标题——标题行一般在
+    页首几百字内，摘要比 1500 字长得多，所以 Ge p.1 那种“摘要很长、引言
+    在 2500 字后”的页面不会被后半页的标题带跑；没有合条件的标题就沿用
+    上一页的章节；第 1 页默认“标题与摘要”（多数论文第 1 页是标题 + 摘要，
+    没有 Abstract 标题行）。单页单标签是近似的：跨章节的页面后半部分
+    会被标成前半部分的章节，对检索是够用的提示，不是精确的章节标注。
     """
     chunks = []
+    section = "标题与摘要"  # 跨页沿用：第 1 页默认标题与摘要
     for p in pages:
+        # 这一页的章节：页首附近第一个标题；没有就沿用上一页的
+        headers = _detect_section_headers(p["text"])
+        near_top = [label for off, label in headers if off < 1500]
+        page_section = near_top[0] if near_top else section
+        context = _chunk_context(p["source"], p["page"], page_section)
         text = _clean_page_text(p["text"])
         # 句子列表：(句子, 起始位置)；超长句子先按词切成几段
         units = []
@@ -111,7 +184,7 @@ def chunk_pages(pages):
         cur, cur_len, cur_start = [], 0, None  # cur 存 (句子, 起始位置)
         for sent, start in units:
             if cur and cur_len + 1 + len(sent) > CHUNK_SIZE:
-                chunks.append({**p, "text": " ".join(s for s, _ in cur), "chunk_start": cur_start})
+                chunks.append({**p, "text": " ".join(s for s, _ in cur), "chunk_start": cur_start, "context": context})
                 # 重叠：新片段带上上个片段末尾的句子，攒够约 CHUNK_OVERLAP 字
                 overlap, overlap_len = [], 0
                 for s, s_start in reversed(cur):
@@ -126,7 +199,8 @@ def chunk_pages(pages):
             cur.append((sent, start))
             cur_len += len(sent) + 1
         if cur:
-            chunks.append({**p, "text": " ".join(s for s, _ in cur), "chunk_start": cur_start})
+            chunks.append({**p, "text": " ".join(s for s, _ in cur), "chunk_start": cur_start, "context": context})
+        section = page_section
     # 过短片段（<50 字）跳过，和原来一样
     return [c for c in chunks if len(c["text"]) >= 50]
 

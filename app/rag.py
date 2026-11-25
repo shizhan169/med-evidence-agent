@@ -109,7 +109,7 @@ def _keyword_chunks(collection, tokens: list, limit: int = 5, exclude_ids=None) 
             c = chunks[i]
             if c["id"] in exclude_ids:
                 continue
-            out.append({"text": c["text"], "source": c["source"], "page": c["page"]})
+            out.append({"text": _strip_context(c["text"]), "source": c["source"], "page": c["page"]})
             if len(out) >= limit:
                 break
         return out
@@ -131,7 +131,7 @@ def _keyword_chunks(collection, tokens: list, limit: int = 5, exclude_ids=None) 
             scored.append((hits, doc, meta))
     scored.sort(key=lambda x: -x[0])
     return [
-        {"text": doc, "source": meta.get("source", "未知"), "page": meta.get("page", "?")}
+        {"text": _strip_context(doc), "source": meta.get("source", "未知"), "page": meta.get("page", "?")}
         for _, doc, meta in scored[:limit]
     ]
 
@@ -158,6 +158,15 @@ def get_collection():
     return client.get_or_create_collection(
         COLLECTION, embedding_function=get_embedding_function()
     )
+
+
+def _strip_context(text: str) -> str:
+    """去掉检索用上下文行（入库时贴在片段前面的那行），回答员只看原文。
+    没有上下文行的旧片段原样返回。"""
+    if (text or "").startswith("【文献："):
+        _, _, rest = text.partition("\n")
+        return rest
+    return text
 
 
 def _chunk_ids(chunks: list) -> list:
@@ -187,7 +196,13 @@ def add_chunks(chunks: list, batch_size: int = 500) -> int:
         return 0
     collection = get_collection()
     ids = _chunk_ids(chunks)
-    docs = [c["text"] for c in chunks]
+    # Contextual Retrieval 便宜版：入库的文档是“上下文 + 原文”，embedding 一起算，
+    # 检索能分清哪篇论文、哪一页、哪个部分；回答时由 retrieve() 把上下文行剥掉，
+    # 模型只看到原文，引用也不变。旧片段没有 context 字段，原样入库。
+    docs = [
+        (c.get("context") + "\n" + c["text"]) if c.get("context") else c["text"]
+        for c in chunks
+    ]
     metas = [
         {
             "source": c.get("source", "未知"),
@@ -235,7 +250,7 @@ def retrieve(query: str, top_k: int = 10):
         for doc, meta, cid in zip(docs, metas, ids):
             seen_ids.add(cid)
             chunks.append(
-                {"text": doc, "source": meta.get("source", "未知"), "page": meta.get("page", "?")}
+                {"text": _strip_context(doc), "source": meta.get("source", "未知"), "page": meta.get("page", "?")}
             )
     except Exception as e:
         print(f"[retrieve] 查询失败：{e}")
