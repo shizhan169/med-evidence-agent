@@ -8,8 +8,9 @@
     eval/results.md    中文总结：总数、已答/拒答、应拒答正确数、引用准确率、逐题表
 
 指标定义：
-    已答 / 拒答：回答是否以“根据现有文献无法回答。”开头
-    （不能只判整句相等：模型常在拒答后加一句解释，那也是拒答）。
+    已答 / 拒答：回答是否以“根据现有文献无法回答”开头（不带句号：
+    模型有时用分号、冒号或直接接解释，如“根据现有文献无法回答；……”、
+    “根据现有文献无法回答具体‘快多少’”，这些都是拒答）。
     应拒答答对：应拒答题被正确拒答的题数。
     引用命中：可回答题返回的引用里包含预期来源（论文 + 页码）。
     注意 run() 返回的引用是检索到的片段列表，所以引用命中实际度量的是
@@ -97,7 +98,7 @@ def main():
         except Exception as e:  # 单题失败不中断整轮评测
             answer, verified, citations, error = "", False, [], str(e)
             print(f"    运行出错：{error}")
-        refused = answer.strip().startswith(REFUSAL)
+        refused = answer.strip().startswith(REFUSAL.rstrip("。"))
         hit = citation_hit(citations, q["expected_file"], q["expected_pages"]) if not refused else False
         records.append({
             "id": q["id"],

@@ -7,7 +7,7 @@ QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen-plus")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-zh-v1.5")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "./models/bge-m3")
 CHROMA_DIR = os.getenv("CHROMA_DIR", "./data/chroma")
 PAPERS_DIR = os.getenv("PAPERS_DIR", "./data/papers")
 

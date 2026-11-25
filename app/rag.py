@@ -1,9 +1,10 @@
 """检索 + 引用格式化。核心规则：没有依据就拒答，引用必须带页码。
 
 检索是混合式：向量检索为主，关键词兜底为辅。
-原因：问题是中文，文献是英文，中文 embedding 模型（bge-small-zh）做跨语言
-向量检索常漏掉含论文名 / 术语 / 数字的关键片段；关键词能直接命中这些
-与语言无关的 token（Bethlehem、MFPR、CentileBrain、123,984 等）。
+原因：问题是中文，文献是英文，跨语言向量检索常漏掉含论文名 / 术语 / 数字的
+关键片段；关键词能直接命中这些与语言无关的 token（Bethlehem、MFPR、
+CentileBrain、123,984 等）。向量和关键词各占一半名额，保证关键词的片段
+一定能进最终结果，不会被向量结果挤掉。
 """
 import re
 
@@ -31,7 +32,12 @@ def _query_tokens(query: str) -> list:
 
 
 def _keyword_chunks(collection, tokens: list, limit: int = 5, exclude_ids=None) -> list:
-    """关键词兜底：按 token 命中数给全库片段打分，取前 limit 个（跳过向量已召回的）。"""
+    """关键词兜底：按 token 命中数给全库片段打分，取前 limit 个（跳过向量已召回的）。
+
+    打分 = 正文命中数 + 文件名命中数 × 2。文件名加权的原因：问题里提到的
+    论文名（Bethlehem、Fujita、Seidel）就在文件名里，加权后该论文的片段
+    会排在前面，避免被其他论文同分片段按入库顺序挤掉。
+    """
     if not tokens:
         return []
     try:
@@ -48,7 +54,9 @@ def _keyword_chunks(collection, tokens: list, limit: int = 5, exclude_ids=None) 
         if cid in exclude_ids:
             continue
         text = (doc or "").lower()
+        fname = (meta.get("source", "") or "").lower()
         hits = sum(1 for t in tokens if t in text)
+        hits += 2 * sum(1 for t in tokens if t in fname)
         if hits:
             scored.append((hits, doc, meta))
     scored.sort(key=lambda x: -x[0])
@@ -109,16 +117,23 @@ def format_citation(chunk: dict) -> str:
 
 
 def retrieve(query: str, top_k: int = 10):
-    """混合检索：向量 top_k 为主，关键词兜底补足。库为空返回 []，走拒答分支；不要编造片段。"""
+    """混合检索：向量和关键词各占一半名额（默认各 5 个），保证关键词的片段
+    一定能进最终结果。库为空返回 []，走拒答分支；不要编造片段。
+
+    注意：不要先拿满 top_k 个向量结果再往后追加关键词——追加的部分会被
+    [:top_k] 截掉，关键词兜底等于没跑（2026-11-25 第二轮评测踩过这个坑）。
+    """
     try:
         collection = get_collection()
     except Exception as e:
         print(f"[retrieve] Chroma 不可用：{e}")
         return []
+    vector_k = top_k // 2
+    keyword_k = top_k - vector_k
     chunks = []
     seen_ids = set()
     try:
-        res = collection.query(query_texts=[query], n_results=top_k)
+        res = collection.query(query_texts=[query], n_results=vector_k)
         docs = (res.get("documents") or [[]])[0]
         metas = (res.get("metadatas") or [[]])[0]
         ids = (res.get("ids") or [[]])[0]
@@ -129,9 +144,9 @@ def retrieve(query: str, top_k: int = 10):
             )
     except Exception as e:
         print(f"[retrieve] 查询失败：{e}")
-    # 关键词兜底：补向量漏掉的含论文名 / 术语 / 数字的片段
+    # 关键词兜底：补向量漏掉的含论文名 / 术语 / 数字的片段，有固定名额
     tokens = _query_tokens(query)
-    chunks.extend(_keyword_chunks(collection, tokens, limit=5, exclude_ids=seen_ids))
+    chunks.extend(_keyword_chunks(collection, tokens, limit=keyword_k, exclude_ids=seen_ids))
     return chunks[:top_k]
 
 
