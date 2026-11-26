@@ -1,6 +1,6 @@
 fastapi==0.115.0
-uvicorn==0.30.0
-pydantic==2.9.0
+uvicorn==0.31.1  # mcp 1.30.0 要求 uvicorn>=0.31.1，0.30.0 装不上（2026-11-26 用户本地 pip 实测冲突）
+pydantic==2.11.0  # mcp 1.30.0 要求 pydantic>=2.11.0，2.9.0 装不上（2026-11-26 用户本地 pip 实测冲突）
 python-dotenv==1.0.1
 langgraph==0.2.0
 langchain-core>=0.2.27,<0.3
@@ -12,7 +12,7 @@ sentence-transformers==3.0.0
 openai==1.40.0
 streamlit==1.37.0
 pytest==8.3.0
-httpx==0.27.0
+httpx==0.27.1  # mcp 1.30.0 要求 httpx>=0.27.1，0.27.0 装不上（2026-11-26 用户本地 pip 实测冲突）
 langsmith==0.1.147  # LangSmith 追踪（只在 LANGSMITH_* 环境变量设置时启用）；0.1.x 才能配 langchain-core 0.2.x（它要求 langsmith<0.2.0），升 langchain-core 时一起升
 langgraph-checkpoint-sqlite==1.0.0  # SQLite checkpointer（会话持久化）；1.0.x 才能配 langgraph 0.2.0 的 langgraph-checkpoint 1.x，升 langgraph 时一起升
 mcp==1.30.0  # MCP 客户端（Python SDK），直连 PubMed MCP 服务端；不用 langchain-mcp-adapters——它所有版本都要求 langchain-core>=0.3.36，和本项目 langgraph 0.2.0 / langchain-core 0.2.x 的钉版冲突（pip 解析失败，2026-11-26 实测），等升级到 langchain-core 0.3+/langgraph 1.x 再换 MultiServerMCPClient
