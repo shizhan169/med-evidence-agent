@@ -3,7 +3,7 @@ import os
 import re
 from typing import TypedDict, List
 
-from .config import CHECKPOINTS_DB, LLM_BASE_URL, LLM_MODEL, get_api_key, tracing_enabled
+from .config import CHECKPOINTS_DB, LLM_BASE_URL, LLM_MODEL, PUBMED_CANDIDATE_K, PUBMED_TOP_K, get_api_key, tracing_enabled
 from .prompts import load_prompt
 
 REFUSAL = "根据现有文献无法回答。"
@@ -113,18 +113,65 @@ def _to_pubmed_query(query: str) -> str:
     return translated
 
 
+def _norm_pubmed_word(w: str) -> str:
+    """PubMed 相关性打分用的词归一：小写；model/modeling/modelling/models
+    归一成 model；复数去尾 s（charts→chart，centiles→centile），ss/us/is
+    结尾的不去（analysis 这类）。"""
+    w = (w or "").lower()
+    if w in ("modelling", "modeling", "models", "modelled", "modeled"):
+        return "model"
+    if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        return w[:-1]
+    return w
+
+
+def _phrase_hit(phrase: str, text_words: set) -> bool:
+    """一个同义表达（引号里的短语）是否命中：表达里的词（归一后）都出现在
+    标题+摘要的词集合里才算命中，不要求相邻。"""
+    words = [_norm_pubmed_word(t) for t in re.findall(r"[A-Za-z]+", phrase)]
+    return bool(words) and all(w in text_words for w in words)
+
+
+def _pubmed_year(r: dict) -> int:
+    """取一篇 PubMed 文章的年份（字符串或整数都行，取不到算 0，即排最后）。"""
+    try:
+        return int(r.get("year") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _rank_pubmed_results(results: list, en_query: str, top_k: int = PUBMED_TOP_K) -> list:
+    """按题目相关性给 PubMed 候选排个序再取前 top_k。主键 = 命中几个 OR 检索
+    式的同义表达（表达里的词都出现在标题+摘要里才算命中）；次键 = 年份倒序
+    （同等相关时新的在前，问“最新”时这就是要的）。方向（研究领域对不对）
+    不单独打分，靠回答员 v2 的相关度分档（直接相关/相关）再把关。不是 OR 式
+    （纯英文问题没翻译、或翻译退回关键词）时按 PubMed 原顺序取前 top_k，不硬排。"""
+    phrases = re.findall(r'"([^"]+)"', en_query or "")
+    if not phrases:
+        return results[:top_k]
+    def key(r):
+        text = f"{r.get('title', '')} {r.get('abstract', '')}"
+        text_words = {_norm_pubmed_word(t) for t in re.findall(r"[A-Za-z]+", text)}
+        hits = sum(1 for p in phrases if _phrase_hit(p, text_words))
+        return (hits, _pubmed_year(r))
+    return sorted(results, key=key, reverse=True)[:top_k]
+
+
 def pubmed_node(state: State):
     """PubMed 工具节点：搜 PubMed（搜 + 取元数据，两次工具调用）。
     调不通/没结果都返回 []，不抛异常——调用方按本地-only/拒答走，问答不断。
-    问“最新文献”时按发表日期倒序排（最新在前），否则按相关性排。"""
+    2026-11-26 改：先多取候选（PUBMED_CANDIDATE_K=30，按相关性排的池子），
+    再按题目相关性重排取前 10——之前问“最新文献”时按发表日期倒序取前 10，
+    最新但相关性差的把真正相关的顶下去了（2024 bioRxiv 常模建模、2023 海
+    马体那两篇直接相关，反而不在前 10 里）。"""
     from .mcp_tools import search_pubmed
 
     query = state.get("retrieval_query") or state["query"]
     en_query = _to_pubmed_query(query)
-    sort = "pub_date" if _asks_new_literature(state.get("query", "")) else "relevance"
-    results = search_pubmed(en_query, sort=sort)
+    candidates = search_pubmed(en_query, top_k=PUBMED_CANDIDATE_K, sort="relevance")
+    results = _rank_pubmed_results(candidates, en_query)
     if results:
-        print(f"[pubmed] 返回 {len(results)} 篇：{', '.join(r['pmid'] for r in results)}")
+        print(f"[pubmed] 候选 {len(candidates)} 篇，取前 {len(results)} 篇：{', '.join(r['pmid'] for r in results)}")
     return {"pubmed_results": results}
 
 

@@ -179,7 +179,10 @@ def test_trigger_new_literature_even_with_local_chunks(monkeypatch):
         drafts=["最新的一篇是 CentileBrain 常模 PubMed PMID:38395541"],
     )
     assert len(search_calls) == 1
-    assert search_calls[0]["sort"] == "pub_date"  # 问最新文献按发表日期排
+    # 2026-11-26 改：候选池按相关性排（sort=relevance），再按题目相关性重排
+    # （命中几个同义表达、再按年份），不再按发表日期倒序直接取前 10
+    assert search_calls[0]["sort"] == "relevance"
+    assert search_calls[0]["top_k"] == 30
     assert result["verified"] is True
     assert "38395541" in result["answer"]
 
@@ -383,6 +386,58 @@ def test_malformed_translation_falls_back_to_keywords(monkeypatch):
     assert result["verified"] is True
 
 
+# ---- 相关性重排：先取 30 候选，再按题目相关性排、取前 10 ----
+
+OR_QUERY = '"longitudinal normative modeling" OR "brain charts" OR "normative brain model"'
+
+_RANK_PAPERS = [
+    # 命中 0 个表达、2027 年：最新但不相关，排最后
+    {"pmid": "1", "title": "Longitudinal brain ageing", "abstract": "longitudinal changes in brain structure", "year": "2027"},
+    # 命中 1 个表达（brain charts）、2026 年
+    {"pmid": "2", "title": "Brain charts across development", "abstract": "brain charts show developmental trajectories", "year": "2026"},
+    # 命中 2 个表达、2024 年（modelling 归一成 model）
+    {"pmid": "3", "title": "Longitudinal normative modelling in schizophrenia", "abstract": "longitudinal normative modelling of brain morphometry", "year": "2024"},
+    # 命中 1 个表达（normative brain model）、2027 年：和 2 同命中数，年份新的在前
+    {"pmid": "4", "title": "Normative modeling of brain morphometry", "abstract": "normative modeling across the lifespan", "year": "2027"},
+    # 命中 3 个表达、2025 年：命中最多，排第一（不是最新）
+    {"pmid": "5", "title": "Normative modelling of brain charts", "abstract": "longitudinal brain charts and normative modelling", "year": "2025"},
+]
+
+
+def test_rank_pubmed_results_by_phrase_hits_then_year():
+    # 主键 = 命中几个同义表达，次键 = 年份倒序
+    ranked = agent._rank_pubmed_results(_RANK_PAPERS, OR_QUERY, top_k=10)
+    assert [r["pmid"] for r in ranked] == ["5", "3", "4", "2", "1"]
+
+
+def test_rank_pubmed_results_trims_to_top_k():
+    ranked = agent._rank_pubmed_results(_RANK_PAPERS, OR_QUERY, top_k=3)
+    assert [r["pmid"] for r in ranked] == ["5", "3", "4"]
+
+
+def test_rank_pubmed_results_non_or_query_keeps_pubmed_order():
+    # 不是 OR 式（纯英文问题没翻译、或翻译退回关键词）时按 PubMed 原顺序取前 top_k，不硬排
+    ranked = agent._rank_pubmed_results(_RANK_PAPERS, "longitudinal brain normative model", top_k=2)
+    assert [r["pmid"] for r in ranked] == ["1", "2"]
+
+
+def test_pubmed_node_fetches_candidates_and_ranks(monkeypatch):
+    # 候选池取 30 篇（按相关性排），再重排取前 10 给回答员；这里只有 2 篇候选，全给
+    result, search_calls, llm = _run_with_mocks(
+        monkeypatch,
+        "最近关于纵向脑常模的新文献有哪些",
+        chunks=[],
+        pubmed_results=PUBMED_RESULTS,
+        drafts=["最新的一篇是 CentileBrain 常模 PubMed PMID:38395541"],
+        translated=OR_QUERY,
+    )
+    assert len(search_calls) == 1
+    assert search_calls[0]["top_k"] == 30
+    assert search_calls[0]["sort"] == "relevance"
+    assert result["verified"] is True
+    assert len(result["citations"]) == 2
+
+
 def test_english_query_skips_translation(monkeypatch):
     # 纯英文问题：不翻译，直接搜原问题，LLM 只调一次（回答）
     result, search_calls, llm = _run_with_mocks(
@@ -424,6 +479,7 @@ def test_config_defaults():
     assert config.MCP_PUBMED_TOOL_SEARCH == "pubmed_search_articles"
     assert config.MCP_PUBMED_TOOL_FETCH == "pubmed_fetch_articles"
     assert config.PUBMED_TOP_K == 10
+    assert config.PUBMED_CANDIDATE_K == 30
 
 
 def test_pubmed_prompt_uses_pmid_format():

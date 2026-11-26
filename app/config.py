@@ -66,3 +66,8 @@ except ValueError:
 NCBI_EMAIL = os.getenv("NCBI_EMAIL", "")
 # 一次 PubMed 查询最多返回几篇（搜 + 取都是这个数）；列文献的问题 5 篇太少，2026-11-26 调到 10
 PUBMED_TOP_K = 10
+# PubMed 先取多少候选再按相关性重排（2026-11-26）：问“最新文献”时按日期倒序
+# 只取 10 篇会把真正相关的旧论文顶下去；先取 30 篇候选（按相关性排的池子）
+# 再重排，取前 10 篇给回答员。VM 真跑：取 30 篇约 8 秒，池子里有 CentileBrain
+#（2024）和 Brain Morphometry Normative Modeling（2024）这类直接相关的
+PUBMED_CANDIDATE_K = 30
