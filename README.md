@@ -30,6 +30,7 @@
 - 会话持久化：LangGraph SQLite checkpointer，`thread_id` 标识一个会话，服务重启后还能接着聊（数据文件 `data/checkpoints.db`）。
 - LangSmith 追踪：只认环境变量（见下），开了能在后台看到每次运行的完整 trace。
 - 提示词管理：prompt 在 `prompts/` 目录按版本管，改 prompt 只改文件，不动代码。
+- MCP PubMed 搜索：本地没证据、或用户明确问新文献时，调 PubMed 搜外部文献（引用格式 `PubMed PMID:xxxxxxxx`），只搜不下，挂了退回本地-only（见下）。
 
 ## 技术栈
 
@@ -106,6 +107,28 @@ LANGSMITH_PROJECT=medevidence
 ```
 之后每次问答都会在 LangSmith 后台留一条 trace：检索到了什么、prompt 是什么、哪步慢、哪步错。不填就完全不追踪，问答不受影响；开了追踪但 key 错了/没填，trace 发不出去（后台报 warning），问答照常跑。
 
+## MCP PubMed 搜索（第 5 步，5a：只搜不下）
+
+本地库只有 26 篇论文，库外的问题原来只能拒答。现在检索员后面多了一条 PubMed 分支：
+
+- **什么时候调**：本地检索不到证据（原来会拒答的那条路），先去 PubMed 找找再决定拒不拒答；用户明确问“最新 / 最近 / 新文献”时，直接调 PubMed（按发表日期倒序，最新在前）。本地能答的，PubMed 不插手。
+- **引用格式**：PubMed 的引用是 `PubMed PMID:xxxxxxxx`，和本地的 `[来源：论文名 p.页码]` 严格区分，答案里一眼看得出这是外部文献。核查员只认本次 PubMed 返回的 PMID，编一个没返回过的 PMID 会被拦下来（走重试/拒答）。
+- **只搜不下**：搜到的文章只用来回答这一次，不写进 Chroma、不进本地 26 篇库（下载和入库是 5b/5c 的事，这次不做）。下次问同样的问题还会再搜一次。
+- **挂了不崩**：MCP 服务端起不来、NCBI 调不通、超时——一律退回本地-only，问答照常。
+
+配置（本地 `.env`，见 `.env.example`）：
+```bash
+NCBI_EMAIL=you@example.com  # NCBI 要求调用时带邮箱，填你自己的；不填也能搜
+# MCP_PUBMED_ENABLED=true   # 设为 false 可以彻底关掉 PubMed
+```
+
+服务端是 `@cyanheads/pubmed-mcp-server` 2.12.4（npx 拉起，stdio 方式），需要本机装 Node.js。注意两点实测结论：
+- 接法没用 `langchain-mcp-adapters` 的 `MultiServerMCPClient`（主流做法）：它所有版本都要求 `langchain-core>=0.3.36`，和本项目 `langgraph 0.2.0` / `langchain-core 0.2.x` 的钉版冲突，`pip install -r requirements.txt` 直接解析失败。改用 Python 的 `mcp` SDK 直连（就是 `langchain-mcp-adapters` 底层用的那个包），等升级到 `langchain-core 0.3+` / `langgraph 1.x` 再换过去。
+- 搜文章的工具叫 `pubmed_search_articles`，只返回 PMID 列表；要标题/作者/期刊/年份/摘要，必须再调 `pubmed_fetch_articles`。所以一次 PubMed 查询是两次工具调用。
+- 中文问题要先翻成英文再搜（PubMed 只认英文），这一步只在 PubMed 路径上调一次 LLM 翻译；本地检索的中文问题翻英文还是以后再说。
+
+评测不受影响：`eval/run_eval.py` 跑 28 道题时传 `use_pubmed=False`，PubMed 关掉——应拒答题本地本来就没证据，按触发规则会走 PubMed，数字会被外部服务带偏、还不可复现。PubMed 能力由 `tests/test_pubmed.py` 的 mock 测试 + 一次真跑验收。
+
 ## 提示词管理
 
 prompt 不写在代码里，放在 `prompts/` 目录按版本管：
@@ -143,7 +166,8 @@ pytest -q  # 全量，不需要真 LLM、不需要 Chroma、不联网（假 LLM 
 ## 目录
 
 - `app/main.py`：FastAPI 入口（`/health`、`/ask`、`/ask/stream`）
-- `app/agent.py`：LangGraph 三角色流程（检索→回答→核查→重试）+ checkpointer
+- `app/agent.py`：LangGraph 三角色流程（检索→回答→核查→重试）+ checkpointer + PubMed 分支
+- `app/mcp_tools.py`：MCP PubMed 搜索（mcp SDK 直连服务端，搜 + 取元数据，只搜不下）
 - `app/rag.py`：混合检索（向量 + BM25）+ 引用格式化 + prompt 拼装
 - `app/ingest.py`：PDF 解析、按句子切分、图注/表注提取、入库
 - `app/config.py`：配置（`.env`）
@@ -161,6 +185,6 @@ pytest -q  # 全量，不需要真 LLM、不需要 Chroma、不联网（假 LLM 
 2. 图注 + 重排（已完成；图注保留、重排关掉）
 3. 核查重试循环（已完成并验收）
 4. 结构收尾（已完成：Docker 验证 + README + 流式，顺手加提示词管理、LangSmith 追踪、checkpointer、评测自动化）
-5. MCP 一个工具（PubMed 搜论文）——下一步，先给方案再动手
+5. MCP 一个工具（PubMed 搜论文，5a 只搜不下——已完成；5b 下载论文、5c 批量入库以后再做）
 
 不做：ReAct 重构、长期记忆、主流版 Contextual Retrieval、OCR 看图读数。

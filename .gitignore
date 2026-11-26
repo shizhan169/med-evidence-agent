@@ -9,4 +9,5 @@ eval/results.md
 eval/results_prev.json
 eval/results_compare.md
 .venv/
-models/  # 本地下载的 embedding 模型（约 90MB），不进仓库
+# 本地下载的 embedding 模型（约 90MB），不进仓库
+models/

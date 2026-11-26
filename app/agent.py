@@ -26,6 +26,15 @@ class State(TypedDict):
     # 核查重试：retries 是已重试次数，retry 是核查员要求再答一次的标志
     retries: int
     retry: bool
+    # PubMed（第 5 步）：pubmed_results 是本次 PubMed 返回的文章列表
+    # [{pmid, title, authors, journal, year, abstract}]，没调 PubMed 时为空；
+    # use_pubmed 是本轮是否允许调 PubMed（评测传 False，保证 28 道题数字不变）
+    pubmed_results: List[dict]
+    use_pubmed: bool
+
+
+# PubMed 引用的格式：PubMed PMID:38395541（冒号后面可带空格，中文冒号也认）
+PMID_RE = re.compile(r"PubMed\s*PMID[:：]?\s*(\d+)")
 
 
 # 多轮对话：历史保留最近 6 轮（一轮 = 一问一答），总字数不超过 4000 字，
@@ -45,6 +54,77 @@ MAX_RETRIES = 2
 # 重答时的提醒：只准引用本次提供的片段里的页码。
 # 文本在 prompts/retry/v1.txt，启动时读进来；改提醒就改那个文件。
 RETRY_REMINDER = load_prompt("retry", "v1")
+
+# PubMed 路径重答时的提醒：只准引用本次 PubMed 返回的 PMID。
+# 文本在 prompts/pubmed_retry/v1.txt，启动时读进来。
+PUBMED_RETRY_REMINDER = load_prompt("pubmed_retry", "v1")
+
+# PubMed 触发：用户明确问新文献的标志词（中文直接匹配，英文小写后匹配）。
+# 问的是“最新/最近/新文献”，要的是库外的新东西，哪怕本地库里有相关片段
+# 也走 PubMed——用户要的新文献不在本地 26 篇里。
+NEW_LITERATURE_MARKERS = ("最新", "最近", "新文献", "新论文", "新研究", "新文章")
+NEW_LITERATURE_MARKERS_EN = ("latest", "recent", "new literature", "new paper", "new study", "new article")
+
+
+def _asks_new_literature(query: str) -> bool:
+    """用户是不是在明确问新文献（“最新 / 最近 / 新文献……”）。"""
+    q = query or ""
+    if any(m in q for m in NEW_LITERATURE_MARKERS):
+        return True
+    ql = q.lower()
+    return any(m in ql for m in NEW_LITERATURE_MARKERS_EN)
+
+
+def _to_pubmed_query(query: str) -> str:
+    """把问题翻成 PubMed 能用的英文检索词。PubMed 只认英文，中文问题直接
+    送过去一个都搜不到；只在 PubMed 路径上调一次 LLM 翻译（temperature 0），
+    翻译失败、翻出来还是中文、没调通就原样返回——search_pubmed 自己会返回 []。
+    纯英文问题不翻译，不多花一次调用。注意这只是给 PubMed 搜的，本地检索
+    的中文问题翻英文（Q09 那个）还是以后再说，不是一回事。"""
+    q = (query or "").strip()
+    if not q:
+        return q
+    if not re.search(r"[\u4e00-\u9fff]", q):
+        return q
+    try:
+        translated = _call_llm(
+            "把下面的中文问题翻译成 PubMed 英文检索关键词，只输出英文词，"
+            "用空格分隔，不要解释、不要加标点：\n" + q
+        )
+    except Exception as e:
+        print(f"[pubmed] 翻译查询失败（{e}），用原问题搜索")
+        return q
+    translated = (translated or "").strip().strip("\"'。")
+    if not translated or re.search(r"[\u4e00-\u9fff]", translated):
+        return q
+    print(f"[pubmed] 查询翻译：{q} → {translated}")
+    return translated
+
+
+def pubmed_node(state: State):
+    """PubMed 工具节点：搜 PubMed（搜 + 取元数据，两次工具调用）。
+    调不通/没结果都返回 []，不抛异常——调用方按本地-only/拒答走，问答不断。
+    问“最新文献”时按发表日期倒序排（最新在前），否则按相关性排。"""
+    from .mcp_tools import search_pubmed
+
+    query = state.get("retrieval_query") or state["query"]
+    en_query = _to_pubmed_query(query)
+    sort = "pub_date" if _asks_new_literature(state.get("query", "")) else "relevance"
+    results = search_pubmed(en_query, sort=sort)
+    if results:
+        print(f"[pubmed] 返回 {len(results)} 篇：{', '.join(r['pmid'] for r in results)}")
+    return {"pubmed_results": results}
+
+
+def _route_after_retriever(state: State) -> str:
+    """检索员之后：PubMed 关了（评测）→ 直接回答（没证据就拒答，和原来一样）；
+    本地有证据且用户没问新文献 → 直接回答；本地没证据、或用户明确问新文献
+    → 走 PubMed 工具节点（有结果就用 PubMed 回答，没结果再按老路走）。"""
+    if not state.get("use_pubmed", True):
+        return "answerer"
+    if state.get("chunks") and not _asks_new_literature(state.get("query", "")):
+        return "answerer"
+    return "pubmed"
 
 
 def _normalize_history(history) -> List[dict]:
@@ -118,14 +198,22 @@ def _call_llm(prompt: str) -> str:
 
 
 def answerer_node(state: State):
-    from .rag import build_prompt
+    from .rag import build_prompt, build_pubmed_prompt
 
-    if not state["chunks"]:
+    pubmed_results = state.get("pubmed_results") or []
+    if pubmed_results:
+        # PubMed 路径：只用 PubMed 返回的文章回答，本地片段不用——两种引用
+        # 体系（PubMed PMID / 本地论文 p.页码）不混在一道答案里，核查也只认 PMID
+        prompt = build_pubmed_prompt(state["query"], pubmed_results, history=state.get("history") or [])
+        reminder = PUBMED_RETRY_REMINDER
+    elif state["chunks"]:
+        prompt = build_prompt(state["query"], state["chunks"], history=state.get("history") or [])
+        reminder = RETRY_REMINDER
+    else:
         return {"draft": REFUSAL}
-    prompt = build_prompt(state["query"], state["chunks"], history=state.get("history") or [])
     if state.get("retries", 0) > 0:
-        # 重答：提醒模型只引用本次提供的片段，上一轮就是引用错了才回来的
-        prompt = prompt + RETRY_REMINDER
+        # 重答：提醒模型只引用本次提供的依据，上一轮就是引用错了才回来的
+        prompt = prompt + reminder
     try:
         draft = _call_llm(prompt)
     except Exception as e:
@@ -147,9 +235,46 @@ def _append_turn_to_history(state: State, final: str) -> List[dict]:
     return _normalize_history(history)
 
 
+def _verification_failed(state: State, reason: str) -> dict:
+    """核查失败的统一收尾：打印原因；还有重试次数就回回答员重答，
+    用完就拒答——绝不编造。"""
+    print(f"[verifier] {reason}")
+    retries = state.get("retries", 0)
+    if retries < MAX_RETRIES:
+        return {"final": "", "verified": False, "retry": True, "retries": retries + 1}
+    return {"final": REFUSAL, "verified": False, "retry": False,
+            "history": _append_turn_to_history(state, REFUSAL)}
+
+
+def _verify_pubmed(state: State, draft: str, pubmed_results: list) -> dict:
+    """PubMed 路径的核查：答案里的每个 PMID 必须在本次 PubMed 返回的列表里，
+    且不许出现本地式引用（[来源：论文名 p.页码]）——两种引用体系不混用。
+    假 PMID（工具没返回过）按引用编造处理，走重试/拒答。"""
+    cited_pmids = set(PMID_RE.findall(draft))
+    real_pmids = {str(r.get("pmid", "")) for r in pubmed_results}
+    local_cites = list(CITE_RE.finditer(draft))
+    if not cited_pmids:
+        return _verification_failed(state, "回答没有给出 PMID 引用")
+    if not cited_pmids.issubset(real_pmids):
+        bad = sorted(cited_pmids - real_pmids)
+        return _verification_failed(state, f"引用的 PMID 不在本次 PubMed 返回结果中：{bad}")
+    if local_cites:
+        return _verification_failed(state, "PubMed 回答里混入了本地式引用")
+    return {"final": draft, "verified": True, "retry": False,
+            "history": _append_turn_to_history(state, draft)}
+
+
 def verifier_node(state: State):
     # 核查规则：draft 里的每个 [来源：... p.X] 必须对应一个真实检索片段，否则拒答
     draft = state.get("draft", "")
+    pubmed_results = state.get("pubmed_results") or []
+    if pubmed_results:
+        # PubMed 路径：只核查 PMID；回答员本来就拒答、LLM 没调通时不重试
+        if draft == REFUSAL or draft.startswith("[待接 LLM]"):
+            final = draft
+            return {"final": final, "verified": False, "retry": False,
+                    "history": _append_turn_to_history(state, final)}
+        return _verify_pubmed(state, draft, pubmed_results)
     if not state.get("chunks") or draft == REFUSAL or draft.startswith("[待接 LLM]"):
         # 没片段、回答员本来就拒答、LLM 没调通：重试也没用，直接结束
         final = REFUSAL if not state.get("chunks") else draft
@@ -163,15 +288,9 @@ def verifier_node(state: State):
         # 引用错了（编了页码、或没给引用）：还有重试次数就回回答员重答，
         # 用完就拒答——绝不编造
         if not cited:
-            print("[verifier] 回答没有给出引用")
-        else:
-            bad = sorted(cited - real)
-            print(f"[verifier] 引用不在检索结果中：{bad}")
-        retries = state.get("retries", 0)
-        if retries < MAX_RETRIES:
-            return {"final": "", "verified": False, "retry": True, "retries": retries + 1}
-        return {"final": REFUSAL, "verified": False, "retry": False,
-                "history": _append_turn_to_history(state, REFUSAL)}
+            return _verification_failed(state, "回答没有给出引用")
+        bad = sorted(cited - real)
+        return _verification_failed(state, f"引用不在检索结果中：{bad}")
     return {"final": draft, "verified": True, "retry": False,
             "history": _append_turn_to_history(state, draft)}
 
@@ -223,10 +342,12 @@ def _build_graph(checkpointer=None):
 
     graph = StateGraph(State)
     graph.add_node("retriever", retriever_node)
+    graph.add_node("pubmed", pubmed_node)
     graph.add_node("answerer", answerer_node)
     graph.add_node("verifier", verifier_node)
     graph.set_entry_point("retriever")
-    graph.add_edge("retriever", "answerer")
+    graph.add_conditional_edges("retriever", _route_after_retriever, {"answerer": "answerer", "pubmed": "pubmed"})
+    graph.add_edge("pubmed", "answerer")
     graph.add_edge("answerer", "verifier")
     graph.add_conditional_edges("verifier", _route_after_verifier, {"answerer": "answerer", "end": END})
     return graph.compile(checkpointer=checkpointer)
@@ -244,7 +365,34 @@ def _dedupe_citations(chunks: List[dict]) -> List[dict]:
     return out
 
 
+def _dedupe_pubmed_citations(results: List[dict]) -> List[dict]:
+    """PubMed 引用列表：按 PMID 去重；每篇只留展示用的字段（来源固定写 PubMed，
+    页码没有——PubMed 的引用就是 PMID 本身）。"""
+    seen = set()
+    out = []
+    for r in results:
+        pmid = str(r.get("pmid", ""))
+        if not pmid or pmid in seen:
+            continue
+        seen.add(pmid)
+        out.append({
+            "source": "PubMed",
+            "pmid": pmid,
+            "title": r.get("title", ""),
+            "journal": r.get("journal", ""),
+            "year": r.get("year", ""),
+        })
+    return out
+
+
 def _to_response(result: dict) -> dict:
+    pubmed_results = result.get("pubmed_results") or []
+    if pubmed_results:
+        return {
+            "answer": result.get("final", REFUSAL),
+            "verified": result.get("verified", False),
+            "citations": _dedupe_pubmed_citations(pubmed_results),
+        }
     return {
         "answer": result.get("final", REFUSAL),
         "verified": result.get("verified", False),
@@ -253,9 +401,11 @@ def _to_response(result: dict) -> dict:
 
 
 def _run_sequential(initial: dict) -> dict:
-    """LangGraph 不可用时的顺序执行兜底，流程和图里一致（含重试循环）。"""
+    """LangGraph 不可用时的顺序执行兜底，流程和图里一致（含 PubMed 分支和重试循环）。"""
     state: State = dict(initial)
     state.update(retriever_node(state))
+    if _route_after_retriever(state) == "pubmed":
+        state.update(pubmed_node(state))
     while True:
         state.update(answerer_node(state))
         state.update(verifier_node(state))
@@ -264,7 +414,7 @@ def _run_sequential(initial: dict) -> dict:
     return state
 
 
-def _run_with_graph(query: str, history=None) -> dict:
+def _run_with_graph(query: str, history=None, use_pubmed: bool = True) -> dict:
     """无持久化的问答路径（原来的 run 逻辑）：建图、invoke，
     图不可用时退回顺序执行。"""
     history = _normalize_history(history)
@@ -273,6 +423,7 @@ def _run_with_graph(query: str, history=None) -> dict:
         "query": query, "chunks": [], "draft": "", "final": "", "verified": False,
         "history": history, "retrieval_query": retrieval_query,
         "retries": 0, "retry": False,
+        "pubmed_results": [], "use_pubmed": use_pubmed,
     }
     try:
         result = _build_graph().invoke(initial)
@@ -282,13 +433,18 @@ def _run_with_graph(query: str, history=None) -> dict:
     return _to_response(result)
 
 
-def run(query: str, history=None, thread_id=None) -> dict:
+def run(query: str, history=None, thread_id=None, use_pubmed: bool = True) -> dict:
     """问答入口。history 可选，不传就是原来的单轮问答；
     传了就是多轮：最近 6 轮进 prompt，追问拼上文去检索。
     thread_id 可选：传了就用 SQLite checkpointer 把这轮对话存下来，
     下次只传 query + thread_id（history 不传）就能接着聊——history
     会从 checkpointer 里恢复；不传就是原来的无状态问答。
-    checkpointer 出问题时退回无持久化的图（会话不保存，但问答照常）。"""
+    checkpointer 出问题时退回无持久化的图（会话不保存，但问答照常）。
+    use_pubmed：本轮是否允许调 PubMed（默认 True）。评测传 False——
+    28 道题测的是本地 RAG，PubMed 是外部服务：应拒答题本地没证据，
+    按触发规则会走 PubMed，数字会被外部服务带偏、还不可复现；
+    PubMed 能力由 tests/test_pubmed.py 的 mock 测试 + 一次真跑验收，
+    不走 28 道题。"""
     if thread_id:
         cm = _get_checkpointer_cm()
         if cm is not None:
@@ -305,9 +461,10 @@ def run(query: str, history=None, thread_id=None) -> dict:
                         "query": query, "chunks": [], "draft": "", "final": "", "verified": False,
                         "history": history, "retrieval_query": retrieval_query,
                         "retries": 0, "retry": False,
+                        "pubmed_results": [], "use_pubmed": use_pubmed,
                     }
                     result = graph.invoke(initial, config=config)
                     return _to_response(result)
             except Exception as e:
                 print(f"[run] checkpointer 不可用，退回无持久化：{e}")
-    return _run_with_graph(query, history)
+    return _run_with_graph(query, history, use_pubmed=use_pubmed)

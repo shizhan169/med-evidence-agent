@@ -80,7 +80,10 @@ def test_bare_refusal_no_retry(monkeypatch):
 
 
 def test_no_chunks_no_retry(monkeypatch):
-    # 没有检索片段：回答员直接拒答，LLM 一次都没调
+    # 没有检索片段、PubMed 关了（评测就是这么跑的）：回答员直接拒答，LLM 一次都没调
+    # 注意：第 5 步之后 PubMed 开着时，没证据会走 PubMed（先调一次 LLM 翻译中文
+    # 问题），所以“一次不调”只在 use_pubmed=False 时成立；开着的情况见
+    # tests/test_pubmed.py::test_no_chunks_with_pubmed_on_searches_then_refuses
     calls = {"n": 0}
 
     def fake_llm(prompt):
@@ -89,7 +92,7 @@ def test_no_chunks_no_retry(monkeypatch):
 
     monkeypatch.setattr("app.rag.retrieve", lambda query, top_k=10: [])
     monkeypatch.setattr("app.agent._call_llm", fake_llm)
-    result = agent.run("总白质体积在几岁达到峰值？")
+    result = agent.run("总白质体积在几岁达到峰值？", use_pubmed=False)
     assert calls["n"] == 0
     assert result["answer"] == agent.REFUSAL
     assert result["verified"] is False

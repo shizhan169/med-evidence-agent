@@ -74,6 +74,10 @@ if ask_clicked and query:
         if citations:
             st.subheader("引用")
             for c in citations:
-                st.write(f"- {c.get('source')} p.{c.get('page')}")
+                if c.get("pmid"):
+                    # PubMed 的引用：来源是 PMID，不是本地论文的页码
+                    st.write(f"- PubMed PMID:{c['pmid']}（{c.get('title', '')}，{c.get('journal', '')} {c.get('year', '')}）")
+                else:
+                    st.write(f"- {c.get('source')} p.{c.get('page')}")
         else:
             st.info("本次无引用，说明文献库中暂无依据。")

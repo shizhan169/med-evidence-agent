@@ -40,3 +40,29 @@ def tracing_enabled():
     →核查）和 LLM 调用都会被记成 trace（需要装 langsmith 包，见
     requirements.txt）。"""
     return LANGSMITH_TRACING == "true"
+
+
+# MCP PubMed 搜索（第 5 步，5a：只搜不下）。
+# 服务端是 @cyanheads/pubmed-mcp-server（npx 拉起，stdio 方式），版本钉死在
+# MCP_PUBMED_ARGS 里（2026-11-26 实测 2.12.4）。需要本机装 Node.js（npx 能跑）；
+# NCBI 要求调用时带邮箱（E-utilities 规范），填进本地 .env 的 NCBI_EMAIL，
+# 不填也能用，但 NCBI 建议填。MCP_PUBMED_ENABLED=false 可以彻底关掉 PubMed
+# （只用本地库）。默认值写死在代码里，不放秘密。
+def _mcp_enabled():
+    return os.getenv("MCP_PUBMED_ENABLED", "true").strip().lower() in ("true", "1", "yes")
+
+
+MCP_PUBMED_ENABLED = _mcp_enabled()
+MCP_PUBMED_COMMAND = os.getenv("MCP_PUBMED_COMMAND", "npx")
+MCP_PUBMED_ARGS = os.getenv("MCP_PUBMED_ARGS", "-y @cyanheads/pubmed-mcp-server@2.12.4")
+# 工具名按服务端 2.12.4 实测：搜文章（只返回 PMID）+ 取文章（拿元数据），
+# 方案稿写的 search_pubmed 在这个版本里不存在
+MCP_PUBMED_TOOL_SEARCH = os.getenv("MCP_PUBMED_TOOL_SEARCH", "pubmed_search_articles")
+MCP_PUBMED_TOOL_FETCH = os.getenv("MCP_PUBMED_TOOL_FETCH", "pubmed_fetch_articles")
+try:
+    MCP_PUBMED_TIMEOUT = int(os.getenv("MCP_PUBMED_TIMEOUT", "120"))
+except ValueError:
+    MCP_PUBMED_TIMEOUT = 120
+NCBI_EMAIL = os.getenv("NCBI_EMAIL", "")
+# 一次 PubMed 查询最多返回几篇（搜 + 取都是这个数）
+PUBMED_TOP_K = 5

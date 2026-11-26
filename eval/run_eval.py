@@ -162,7 +162,11 @@ def main():
     for idx, q in enumerate(questions, 1):
         print(f"[{idx}/{len(questions)}] {q['id']}：{q['question']}")
         try:
-            result = run(q["question"])
+            # 评测只测本地 RAG：use_pubmed=False 关掉 PubMed。28 道题里应拒答题
+            # 本地本来就没证据，按触发规则会走 PubMed——数字会被外部服务带偏、
+            # 还不可复现（PubMed 的内容和通不通都会变）。PubMed 能力由
+            # tests/test_pubmed.py 的 mock 测试 + 一次真跑验收，不走 28 道题。
+            result = run(q["question"], use_pubmed=False)
             answer = result.get("answer", "")
             verified = result.get("verified", False)
             citations = result.get("citations", [])

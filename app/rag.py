@@ -359,3 +359,42 @@ def build_prompt(query: str, chunks: list, history: list = None) -> str:
             + "\n".join(lines) + "\n\n"
         )
     return ANSWERER_TEMPLATE.format(history_text=history_text, context=context, query=query)
+
+
+PUBMED_ANSWERER_TEMPLATE = load_prompt("pubmed_answerer", "v1")
+
+
+def format_pubmed_citation(result: dict) -> str:
+    """PubMed 引用的统一格式：PubMed PMID:xxxxxxxx，和本地的
+    [来源：论文名 p.页码] 严格区分，答案里一眼看得出这是外部文献。"""
+    return f"PubMed PMID:{result.get('pmid', '?')}"
+
+
+def build_pubmed_prompt(query: str, results: list, history: list = None) -> str:
+    """拼 PubMed 回答员的 prompt。results 是 search_pubmed 返回的文章列表，
+    每篇只给标题/作者/期刊年份/摘要片段（600 字内），引用格式是
+    PubMed PMID:xxxxxxxx。history 只用来理解追问里的指代，引用只能来自
+    本次提供的 PubMed 文章，不能引用历史里的 PMID/页码——历史里的引用
+    可能不在本次 PubMed 返回结果里，核查员会按本次结果校验，引用了就会判错。"""
+    blocks = []
+    for r in results:
+        blocks.append(
+            f"标题：{r.get('title', '')}\n"
+            f"作者：{r.get('authors', '')}\n"
+            f"期刊：{r.get('journal', '')}（{r.get('year', '')}）\n"
+            f"摘要：{r.get('abstract', '')}\n"
+            f"引用：{format_pubmed_citation(r)}"
+        )
+    context = "\n\n".join(blocks)
+    history_text = ""
+    if history:
+        lines = []
+        for msg in history:
+            role = "用户" if msg.get("role") == "user" else "助手"
+            lines.append(f"{role}：{msg.get('content', '')}")
+        history_text = (
+            "对话历史（只用来理解追问里的指代，比如“那白质呢”里的“白质”指什么；\n"
+            "回答的引用只能来自下面本次提供的 PubMed 文献，不要引用历史里的 PMID 或页码）：\n"
+            + "\n".join(lines) + "\n\n"
+        )
+    return PUBMED_ANSWERER_TEMPLATE.format(history_text=history_text, context=context, query=query)
