@@ -64,5 +64,5 @@ try:
 except ValueError:
     MCP_PUBMED_TIMEOUT = 120
 NCBI_EMAIL = os.getenv("NCBI_EMAIL", "")
-# 一次 PubMed 查询最多返回几篇（搜 + 取都是这个数）
-PUBMED_TOP_K = 5
+# 一次 PubMed 查询最多返回几篇（搜 + 取都是这个数）；列文献的问题 5 篇太少，2026-11-26 调到 10
+PUBMED_TOP_K = 10

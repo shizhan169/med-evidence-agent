@@ -392,7 +392,7 @@ def test_config_defaults():
     assert "@cyanheads/pubmed-mcp-server@2.12.4" in config.MCP_PUBMED_ARGS
     assert config.MCP_PUBMED_TOOL_SEARCH == "pubmed_search_articles"
     assert config.MCP_PUBMED_TOOL_FETCH == "pubmed_fetch_articles"
-    assert config.PUBMED_TOP_K == 5
+    assert config.PUBMED_TOP_K == 10
 
 
 def test_pubmed_prompt_uses_pmid_format():
@@ -401,3 +401,20 @@ def test_pubmed_prompt_uses_pmid_format():
     assert "Normative modelling of brain morphometry" in prompt
     assert "不要自己编 PMID" in prompt
     assert "[来源：" not in prompt  # PubMed 模板里不出现本地引用格式
+
+
+def test_pubmed_prompt_v2_lists_literature():
+    """v2 分两种问法：列文献时把相关论文都列出来、相关性分档直说，
+    不能因为没用原词就悄悄扔掉（2026-11-26 用户本地实测：v1 只剩 1 篇）。"""
+    from app.rag import PUBMED_ANSWERER_TEMPLATE
+
+    assert "问有哪些文献" in PUBMED_ANSWERER_TEMPLATE
+    assert "直接相关" in PUBMED_ANSWERER_TEMPLATE
+    assert "悄悄扔掉" in PUBMED_ANSWERER_TEMPLATE
+    assert "不要自己编 PMID" in PUBMED_ANSWERER_TEMPLATE
+    assert "{history_text}" in PUBMED_ANSWERER_TEMPLATE
+    assert "{context}" in PUBMED_ANSWERER_TEMPLATE
+    assert "{query}" in PUBMED_ANSWERER_TEMPLATE
+    prompt = build_pubmed_prompt("最近关于纵向脑常模的新文献有哪些", PUBMED_RESULTS)
+    assert "问有哪些文献" in prompt
+    assert "[来源：" not in prompt

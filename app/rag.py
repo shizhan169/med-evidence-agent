@@ -361,7 +361,7 @@ def build_prompt(query: str, chunks: list, history: list = None) -> str:
     return ANSWERER_TEMPLATE.format(history_text=history_text, context=context, query=query)
 
 
-PUBMED_ANSWERER_TEMPLATE = load_prompt("pubmed_answerer", "v1")
+PUBMED_ANSWERER_TEMPLATE = load_prompt("pubmed_answerer", "v2")  # v2：分两种问法——具体问题严格回答，列文献时把相关论文都列出来（2026-11-26，v1 太严，列文献只剩 1 篇）
 
 
 def format_pubmed_citation(result: dict) -> str:
