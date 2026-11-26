@@ -9,18 +9,17 @@
 ## 当前状态（2026-11-25）
 
 - 文献库：26 篇纵向常模方向的论文，596 页，4456 个片段（含 147 条图注 + 28 条表注）。
-- 第九轮评测（28 道题：原 20 道 + 图表 8 道）：
+- 最新一轮评测（28 道题：原 20 道 + 图表 8 道）：
   - 原 20 题：可回答已答 **13/15**，引用准确率 **92.3%（12/13）**，应拒答 5/5，编造 0 次。
   - 图表题：脚本计 4/6（引用 100%），人工逐题核对全对 2/6（F04、F05）；应拒答 2/2，编造 0 次。
   - 总计应拒答 7/7，编造 0 次。
-  - 最好的单轮引用准确率是第五轮的 100%（13/13）；回填简历以最新一轮为准。
-- 重排器（bge-reranker-base）已关掉：第六轮探针钉死是重排把对的片段排掉了（Q05、Q11），图注无辜。本地 `.env` 里 `RERANKER_MODEL` 指到不存在的路径，检索退回向量 5 + BM25 5，不重排。
+- 检索：向量（bge-m3）+ BM25 混合，各取前 5；重排器（bge-reranker-base）已停用——实测发现它会把正确片段排掉。
 
 ## 架构：输入 - 处理 - 输出
 
 输入：用户问题 + PDF 论文库
-处理（LangGraph 三角色，轻量版多智能体）：
-1. 检索员 Retriever：混合检索——向量（bge-m3）+ 关键词（BM25）各占一半名额；有重排模型时池子 15+15、重排取前 5，没有时向量 5 + BM25 5。
+处理（LangGraph 三角色）：
+1. 检索员 Retriever：混合检索——向量（bge-m3）+ 关键词（BM25）各取前 5。入库时给每个片段附加上下文（来源论文、页码、章节），与正文一起计算 embedding，检索相关性更好；回答时剥离上下文，引用不受影响。
 2. 回答员 Answerer：Qwen / DeepSeek API 生成带引用的回答；多轮对话带最近 6 轮历史（4000 字上限），追问拼上文去检索。
 3. 核查员 Verifier：检查每个引用是否在真实检索片段里；引用错了或没给引用就让回答员重答（最多 2 次），再不过就拒答。
 输出：回答 + 引用列表 + 核查是否通过。
@@ -49,7 +48,7 @@ cp .env.example .env  # 填入 QWEN_API_KEY 或 DEEPSEEK_API_KEY
 模型用 ModelScope 下载到本地（bge-m3 是多语言模型，中英文都支持）：
 ```bash
 modelscope download --model BAAI/bge-m3 --local_dir ./models/bge-m3
-# 重排模型已关掉，不用下；想开再下：
+# 重排模型已停用，不用下；想启用再下：
 # modelscope download --model BAAI/bge-reranker-base --local_dir ./models/bge-reranker-base
 ```
 
@@ -67,7 +66,7 @@ streamlit run app/streamlit_app.py  # 另开一个终端，演示页面
 模型和数据不进镜像，运行时挂载；API key 只在本地 `.env`，不进镜像：
 
 ```powershell
-# PowerShell，在项目根目录 D:\agent\med-evidence-agent
+# PowerShell，在项目根目录
 docker build -t medevidence .
 docker run -d --name medevidence -p 8000:8000 `
   -v ${PWD}/models:/app/models `
@@ -107,14 +106,14 @@ LANGSMITH_PROJECT=medevidence
 ```
 之后每次问答都会在 LangSmith 后台留一条 trace：检索到了什么、prompt 是什么、哪步慢、哪步错。不填就完全不追踪，问答不受影响；开了追踪但 key 错了/没填，trace 发不出去（后台报 warning），问答照常跑。
 
-## MCP PubMed 搜索（第 5 步，5a：只搜不下）
+## MCP PubMed 搜索
 
 本地库只有 26 篇论文，库外的问题原来只能拒答。现在检索员后面多了一条 PubMed 分支：
 
 - **什么时候调**：本地检索不到证据（原来会拒答的那条路），先去 PubMed 找找再决定拒不拒答；用户明确问“最新 / 最近 / 新文献”时，直接调 PubMed（按发表日期倒序，最新在前）。本地能答的，PubMed 不插手。
 - **引用格式**：PubMed 的引用是 `PubMed PMID:xxxxxxxx`，和本地的 `[来源：论文名 p.页码]` 严格区分，答案里一眼看得出这是外部文献。核查员只认本次 PubMed 返回的 PMID，编一个没返回过的 PMID 会被拦下来（走重试/拒答）。
-- **只搜不下**：搜到的文章只用来回答这一次，不写进 Chroma、不进本地 26 篇库（下载和入库是 5b/5c 的事，这次不做）。下次问同样的问题还会再搜一次。
-- **挂了不崩**：MCP 服务端起不来、NCBI 调不通、超时——一律退回本地-only，问答照常。
+- **只搜不下**：搜到的文章只用于本次回答，不写入本地库。下次问同样的问题还会再搜一次。
+- **异常时退回本地**：MCP 服务端起不来、NCBI 调不通、超时——一律退回本地-only，问答照常。
 
 配置（本地 `.env`，见 `.env.example`）：
 ```bash
@@ -122,12 +121,12 @@ NCBI_EMAIL=you@example.com  # NCBI 要求调用时带邮箱，填你自己的；
 # MCP_PUBMED_ENABLED=true   # 设为 false 可以彻底关掉 PubMed
 ```
 
-服务端是 `@cyanheads/pubmed-mcp-server` 2.12.4（npx 拉起，stdio 方式），需要本机装 Node.js。注意两点实测结论：
-- 接法没用 `langchain-mcp-adapters` 的 `MultiServerMCPClient`（主流做法）：它所有版本都要求 `langchain-core>=0.3.36`，和本项目 `langgraph 0.2.0` / `langchain-core 0.2.x` 的钉版冲突，`pip install -r requirements.txt` 直接解析失败。改用 Python 的 `mcp` SDK 直连（就是 `langchain-mcp-adapters` 底层用的那个包），等升级到 `langchain-core 0.3+` / `langgraph 1.x` 再换过去。
-- 搜文章的工具叫 `pubmed_search_articles`，只返回 PMID 列表；要标题/作者/期刊/年份/摘要，必须再调 `pubmed_fetch_articles`。所以一次 PubMed 查询是两次工具调用。
-- 中文问题要先翻成英文再搜（PubMed 只认英文），这一步只在 PubMed 路径上调一次 LLM 翻译；本地检索的中文问题翻英文还是以后再说。
+服务端是 `@cyanheads/pubmed-mcp-server` 2.12.4（npx 拉起，stdio 方式），需要本机装 Node.js。实现上有三点要注意：
+- 用 Python 的 `mcp` SDK 直连服务端（`langchain-mcp-adapters` 要求 langchain-core ≥ 0.3，与本项目 langgraph 0.2.x / langchain-core 0.2.x 不兼容）。
+- 搜索分两步：`pubmed_search_articles` 只返回 PMID 列表，再调 `pubmed_fetch_articles` 拿标题、作者、期刊、年份、摘要。所以一次 PubMed 查询是两次工具调用。
+- 中文问题先翻成英文再搜（PubMed 只认英文），翻译只在 PubMed 路径上进行。
 
-评测不受影响：`eval/run_eval.py` 跑 28 道题时传 `use_pubmed=False`，PubMed 关掉——应拒答题本地本来就没证据，按触发规则会走 PubMed，数字会被外部服务带偏、还不可复现。PubMed 能力由 `tests/test_pubmed.py` 的 mock 测试 + 一次真跑验收。
+评测时 PubMed 默认关闭（`eval/run_eval.py` 传 `use_pubmed=False`），28 道题只测本地检索。
 
 ## 提示词管理
 
@@ -144,12 +143,12 @@ prompt 不写在代码里，放在 `prompts/` 目录按版本管：
 
 ```bash
 python eval/run_eval.py        # 跑 28 题，结果写进 eval/results.json + eval/results.md
-python eval/run_eval_auto.py   # 一键：跑评测 + 自动和上一轮对比 + 按停表规则判通过/不通过
+python eval/run_eval_auto.py   # 一键：跑评测 + 自动和上一轮对比 + 按通过标准判通过/不通过
 ```
 
-`run_eval_auto.py` 的流程：先把现有的 `eval/results.json` 备份成 `eval/results_prev.json`，再跑评测，逐题对比（哪些退步、哪些进步），按停表规则判——原 20 题可回答已答 >= 12/15，且原 20 题没有新的严重退步→通过（退出码 0），否则不通过（退出码 1）。对比报告写进 `eval/results_compare.md`。
+`run_eval_auto.py` 的流程：先把现有的 `eval/results.json` 备份成 `eval/results_prev.json`，再跑评测，逐题对比（哪些退步、哪些进步），按通过标准判定——原 20 题可回答已答 >= 12/15，且原 20 题没有新的严重退步→通过（退出码 0），否则不通过（退出码 1）。对比报告写进 `eval/results_compare.md`。
 
-注意：完整评测只能在本地跑（需要 bge-m3 和 DeepSeek key），所以这不是 GitHub Actions——GitHub 上跑不了。是本地一键 + 对比报告。
+注意：完整评测在本地运行（需要 bge-m3 和 DeepSeek key）。
 
 指标口径（`eval/run_eval.py` 开头有完整说明）：
 - 已答/拒答：回答的第一句里是否出现“无法回答”。
@@ -177,14 +176,3 @@ pytest -q  # 全量，不需要真 LLM、不需要 Chroma、不联网（假 LLM 
 - `eval/test_questions.md`：28 道评测题；`eval/run_eval.py`：评测脚本；`eval/run_eval_auto.py`：评测自动化
 - `eval/check_retrieval.py`：检索级验证（不需要 LLM/Chroma/embedding）
 - `data/papers/`：放公开论文 PDF，不要放 ADNI/NACC 受限数据
-- `docs/engineering-notes.md`：工程问题记录（开始的效果 / 遇到的问题 / 原因 / 怎么改的 / 提效）
-
-## 路线（已定版）
-
-1. 便宜版 Contextual Retrieval（已完成，保留）
-2. 图注 + 重排（已完成；图注保留、重排关掉）
-3. 核查重试循环（已完成并验收）
-4. 结构收尾（已完成：Docker 验证 + README + 流式，顺手加提示词管理、LangSmith 追踪、checkpointer、评测自动化）
-5. MCP 一个工具（PubMed 搜论文，5a 只搜不下——已完成；5b 下载论文、5c 批量入库以后再做）
-
-不做：ReAct 重构、长期记忆、主流版 Contextual Retrieval、OCR 看图读数。
