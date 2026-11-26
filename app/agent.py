@@ -76,8 +76,10 @@ def _asks_new_literature(query: str) -> bool:
 
 
 def _to_pubmed_query(query: str) -> str:
-    """把问题翻成 PubMed 能用的英文检索词。PubMed 只认英文，中文问题直接
-    送过去一个都搜不到；只在 PubMed 路径上调一次 LLM 翻译（temperature 0），
+    """把问题翻成 PubMed 能用的英文检索式。PubMed 只认英文，中文问题直接
+    送过去一个都搜不到；只在 PubMed 路径上调一次 LLM 翻译（temperature 0）。
+    2026-11-26 改：让 LLM 给核心概念的 2-3 个英文同义表达，用 OR 连接，
+    扩大召回（之前是字面词组直译，搜到的太少——“纵向脑常模模型”只搜到 3 篇）。
     翻译失败、翻出来还是中文、没调通就原样返回——search_pubmed 自己会返回 []。
     纯英文问题不翻译，不多花一次调用。注意这只是给 PubMed 搜的，本地检索
     的中文问题翻英文（Q09 那个）还是以后再说，不是一回事。"""
@@ -88,15 +90,25 @@ def _to_pubmed_query(query: str) -> str:
         return q
     try:
         translated = _call_llm(
-            "把下面的中文问题翻译成 PubMed 英文检索关键词，只输出英文词，"
-            "用空格分隔，不要解释、不要加标点：\n" + q
+            "把下面的中文问题翻译成 PubMed 英文检索式：找出核心概念，"
+            "给出 2-3 个英文同义表达，每个加英文双引号，用 OR 连接。"
+            "只输出检索式，不要解释：\n" + q
         )
     except Exception as e:
         print(f"[pubmed] 翻译查询失败（{e}），用原问题搜索")
         return q
-    translated = (translated or "").strip().strip("\"'。")
+    translated = (translated or "").strip().rstrip("。")
     if not translated or re.search(r"[\u4e00-\u9fff]", translated):
         return q
+    # 整个输出被一对引号包起来时才去掉外层引号；OR 式里多个引号短语不动
+    if len(translated) >= 2 and translated.startswith('"') and translated.endswith('"') and translated.count('"') == 2:
+        translated = translated[1:-1]
+    # 校验 OR 检索式：要有 OR、双引号成对；不合规就把词拼成空格分隔的关键词
+    if "OR" not in translated.upper() or translated.count('"') % 2 != 0:
+        words = re.findall(r"[A-Za-z][A-Za-z\- ]+", translated)
+        fallback = " ".join(w.strip() for w in words if w.strip())
+        print(f"[pubmed] 翻译格式不对，用关键词搜索：{fallback}")
+        return fallback or q
     print(f"[pubmed] 查询翻译：{q} → {translated}")
     return translated
 

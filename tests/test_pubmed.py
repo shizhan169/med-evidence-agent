@@ -352,6 +352,37 @@ def test_chinese_query_translated_before_search(monkeypatch):
     assert result["verified"] is True
 
 
+def test_chinese_query_translated_to_or_synonyms(monkeypatch):
+    # 2026-11-26 改：翻译输出核心概念的 2-3 个同义表达，用 OR 连接，扩大召回
+    or_query = '"longitudinal normative modeling" OR "brain charts" OR "normative brain model"'
+    result, search_calls, llm = _run_with_mocks(
+        monkeypatch,
+        "最近关于纵向脑常模的新文献有哪些",
+        chunks=[],
+        pubmed_results=PUBMED_RESULTS,
+        drafts=["最新的一篇是 CentileBrain 常模 PubMed PMID:38395541"],
+        translated=or_query,
+    )
+    assert llm["translate"] == 1
+    assert search_calls[0]["query"] == or_query
+    assert result["verified"] is True
+
+
+def test_malformed_translation_falls_back_to_keywords(monkeypatch):
+    # 翻译格式不对（引号不成对、没有 OR）就退回空格分隔的关键词，不直接拿坏检索式去搜
+    result, search_calls, llm = _run_with_mocks(
+        monkeypatch,
+        "最近关于纵向脑常模的新文献有哪些",
+        chunks=[],
+        pubmed_results=PUBMED_RESULTS,
+        drafts=["最新的一篇是 CentileBrain 常模 PubMed PMID:38395541"],
+        translated='"longitudinal normative modeling',
+    )
+    assert search_calls[0]["query"] == "longitudinal normative modeling"
+    assert '"' not in search_calls[0]["query"]
+    assert result["verified"] is True
+
+
 def test_english_query_skips_translation(monkeypatch):
     # 纯英文问题：不翻译，直接搜原问题，LLM 只调一次（回答）
     result, search_calls, llm = _run_with_mocks(
