@@ -628,6 +628,22 @@ def answerer_node(state: State):
         reminder = RETRY_REMINDER
     else:
         return {"draft": REFUSAL}
+    subtasks = state.get("subtasks") or []
+    if subtasks:
+        # 2.2 汇总缺口修法：规划任务的回答员必须覆盖全部子任务。
+        # 原来 prompt 里只有问题和片段，没有子任务清单，回答员可能悄悄漏掉
+        # 一个维度/一篇论文，核查还报 verified（引用都是真的、子任务也都有证据，
+        # 只是答案里没用上）。这里把子任务清单写进 prompt，要求每个都覆盖、
+        # 每个至少引用一次它的证据。
+        sub_lines = "\n".join(
+            f"- {st.get('task_id', '')}：{st.get('query', '')}"
+            for st in subtasks if st.get("query")
+        )
+        if sub_lines:
+            prompt += (
+                "\n\n注意：这是一个多步骤任务，答案必须覆盖以下全部子任务，"
+                "每个子任务至少引用一次它的证据，不要漏掉任何一个：\n" + sub_lines + "\n"
+            )
     if state.get("retries", 0) > 0:
         # 重答：提醒模型只引用本次提供的依据，上一轮就是引用错了才回来的
         prompt = prompt + reminder
