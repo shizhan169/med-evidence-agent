@@ -97,6 +97,26 @@ def test_chart_locate_not_found(monkeypatch):
     assert result["data"]["found"] is False
 
 
+def test_chart_locate_real_stored_format(monkeypatch):
+    # 回归：真实库里存的文档是 context 行 + 图注正文
+    # （rag.add_chunks 把 context 贴在前面），不能只认裸 "Figure N." 开头。
+    # 2026-11-28 用户本地验证发现：不剥 context 行，_find_caption 在真实库里
+    # 一张图都找不到，chart_read 直接报 available=False，VLM 根本没被调到。
+    real_docs = [
+        "【文献：Fujita 2023｜第 8 页｜结果】 figure3\n"
+        "Figure 3. Ridgeline plots showing distributions of rates of change.",
+        "【文献：Fujita 2023｜第 8 页｜结果】 figure4\n"
+        "Figure 4. GAM smooths with 95% confidence intervals.",
+    ]
+    monkeypatch.setattr("app.tools._open_collection",
+                        lambda: _FakeCollection(real_docs, CAPTION_METAS))
+    result = tools.call_tool("chart_locate", paper="fujita", figure_no=4)
+    assert result["data"]["found"] is True
+    assert result["data"]["page"] == 8
+    assert result["data"]["caption"].startswith("Figure 4.")
+    assert "【文献" not in result["data"]["caption"]
+
+
 def test_chart_locate_collection_unavailable(monkeypatch):
     # 库打不开（不存在 / 损坏）：返回 found=False，不抛异常
     def boom():

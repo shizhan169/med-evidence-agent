@@ -142,14 +142,20 @@ def _find_caption(paper: str, figure_no) -> dict:
         # 论文名匹配：传全名或关键词都行，双向包含就算（大小写不敏感）
         if paper_l and paper_l not in source.lower() and source.lower() not in paper_l:
             continue
-        m = _FIGURE_RE.match((doc or "").strip())
+        # 入库文档前面贴了一行检索用上下文（【文献：…】 figure4），
+        # 先剥掉再认图号——不然 _FIGURE_RE 永远对不上开头，真实库里一张图都找不到。
+        doc_text = (doc or "").strip()
+        if doc_text.startswith("【文献："):
+            _, _, doc_text = doc_text.partition("\n")
+            doc_text = doc_text.strip()
+        m = _FIGURE_RE.match(doc_text)
         if not m or m.group(2) != num:
             continue
         return {
             "found": True,
             "kind": m.group(1).capitalize(),
             "page": meta.get("page", "?"),
-            "caption": (doc or "").strip(),
+            "caption": doc_text,
             "source": source,
         }
     return {"found": False}
