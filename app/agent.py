@@ -2,8 +2,8 @@
 框架 v2 第一阶段 1.1：入口加了 Router 节点（结构化路由），State 加了
 route / plan / subtasks / tool_calls / figure / error，verified 改名
 answer_status（四种最终状态）。1.2：planner / executor 节点已实现，
-router 的 planning 分支走真正的 planner；chart_read 节点还没实现，
-router 的 vision 分支这一步仍临时直通 retriever（见 _build_graph 的 TODO）。
+router 的 planning 分支走真正的 planner；2.3：chart_read 节点已实现，
+router 的 vision 分支走 VLM 读图（没图可读时退回 retriever 兜底）。
 1.4：历史管理抽到 app/memory.py；历史超限时被截掉的轮次先摘要进
 State["history_summary"] 再丢，prompt 只拼最近 2 轮完整内容 + 摘要；
 checkpointer 里仍是最近 6 轮完整历史，压缩不影响持久化。1.5：核查员加
@@ -223,7 +223,7 @@ def router_node(state: State):
 def _route_after_router(state: State) -> str:
     """router 之后的分流，优先级：planning → vision → 外部搜索 → 本地检索。
     返回的是逻辑目的地（"planner"/"chart_read"/"pubmed"/"retriever"），
-    图里的映射把还没实现的 chart_read 节点临时直通 retriever（见 _build_graph 的 TODO）。
+    图里的映射把 chart_read 指向真正的 chart_read 节点（VLM 读图）。
     use_pubmed=False（评测）时不走 PubMed——评测的 28 道题测本地 RAG，
     外部搜索开关关了，路由也不触发。"""
     route = state.get("route") or {}
@@ -571,6 +571,68 @@ def _build_retrieval_query(query: str, history: List[dict]) -> str:
     from .rag import rewrite_query_for_retrieval
 
     return rewrite_query_for_retrieval(query, history, llm_call=_call_llm)
+
+
+def _extract_paper_and_figure(query: str):
+    """从图表问题里抽论文名和图号。
+    图号：第一个 "图 N"；论文：问题开头的拉丁作者名（连续的拉丁词，
+    遇到数字/中文就停），去空格、去重音后返回，供 chart_locate 的子串匹配用
+    （Di Biase→dibiase、Coupé→coupe，对上文件名里的 dibiase/coupe）。
+    抽不到图号返回 (None, None)，调用方退回 retriever。"""
+    import unicodedata
+
+    q = query or ""
+    m = re.search(r"图\s*(\d+)", q)
+    if not m:
+        return None, None
+    figure_no = m.group(1)
+    lead = re.match(r"^[A-Za-zÀ-ÿ]+(?:\s+[A-Za-zÀ-ÿ]+)*", q.strip())
+    if not lead:
+        return None, figure_no
+    norm = unicodedata.normalize("NFKD", lead.group(0)).encode("ascii", "ignore").decode()
+    paper = re.sub(r"\s+", "", norm).lower()
+    return (paper or None), figure_no
+
+
+def chart_read_node(state: State):
+    """图表题节点（第二阶段 2.3）：VLM 读图。
+    先从问题里抽论文 + 图号，调 chart_read 工具拿 VLM 读图结果；
+    成功时把读图结果转成一个可引用片段（source=论文文件名、page=图所在页，
+    text=VLM 原文 + 图注），回答员按正常引用流程引用它，核查员按 (source, page)
+    校验。降级（数字对不上图注）时在片段里注明，回答员不把存疑数字当定论。
+    没图可读（本地没 PDF、图号找不到、VLM 调不通、问题里抽不出图号）时
+    退回 retriever（图注/正文路径），图表题不断答——老行为是兜底。"""
+    from .rag import retrieve
+
+    query = state.get("query", "")
+    tool_calls = list(state.get("tool_calls") or [])
+    paper, figure_no = _extract_paper_and_figure(query)
+    if paper and figure_no:
+        result = call_tool("chart_read", paper=paper, figure_no=figure_no, question=query)
+        tool_calls.append({
+            "tool": "chart_read",
+            "params": {"paper": paper, "figure_no": figure_no, "question": query},
+            "result": result.get("data"), "success": result.get("success", False),
+            "error": result.get("error"),
+        })
+        data = result.get("data") or {}
+        if result.get("success") and data.get("available"):
+            source = data.get("source") or ""
+            page = data.get("page")
+            reading = data.get("reading") or ""
+            caption = data.get("caption") or ""
+            text = f"图注：{caption}\nVLM 读图：{reading}" if caption else reading
+            if data.get("downgraded"):
+                text += "\n（注意：VLM 读出的部分数字与图注不符，以下数字可能不准）"
+            chunk = {"source": source, "page": page, "text": text}
+            figure = {"paper": source, "page": page, "figure_no": data.get("figure_no") or figure_no,
+                      "image_path": "", "caption": caption}
+            return {"chunks": [chunk], "tool_calls": tool_calls, "figure": figure}
+        print(f"[chart_read] VLM 不可用（{data.get('reason') or result.get('error')}），退回 retriever")
+    else:
+        print("[chart_read] 问题里抽不出论文/图号，退回 retriever")
+    chunks = retrieve(state.get("retrieval_query") or query, top_k=10, llm_call=_call_llm)
+    return {"chunks": chunks, "tool_calls": tool_calls}
 
 
 def retriever_node(state: State):
@@ -1051,16 +1113,16 @@ def _build_graph(checkpointer=None):
     graph.add_node("planner", planner_node)
     graph.add_node("executor", executor_node)
     graph.add_node("retriever", retriever_node)
+    graph.add_node("chart_read", chart_read_node)
     graph.add_node("pubmed", pubmed_node)
     graph.add_node("answerer", answerer_node)
     graph.add_node("verifier", verifier_node)
     graph.set_entry_point("router")
-    # router 之后的分流。chart_read 节点还没实现（2.3），
-    # 这一步先把这个分支临时直通 retriever，保证图完整可跑；
-    # 节点实现后把映射改成真正的节点名。
+    # router 之后的分流：vision 分支走 chart_read 节点（VLM 读图，
+    # 没图可读时节点内部退回 retriever）；planning 走 planner，外部搜索走 pubmed。
     graph.add_conditional_edges("router", _route_after_router, {
         "planner": "planner",
-        "chart_read": "retriever",  # TODO(2.3): 改成 chart_read 节点
+        "chart_read": "chart_read",
         "pubmed": "pubmed",
         "retriever": "retriever",
     })
@@ -1068,6 +1130,7 @@ def _build_graph(checkpointer=None):
     # executor 执行完，证据已汇总进 chunks / pubmed_results，直接去回答员；
     # 不再经过 retriever（证据已经由子任务的工具调用拿到，不用再查一遍）。
     graph.add_edge("executor", "answerer")
+    graph.add_edge("chart_read", "answerer")
     graph.add_conditional_edges("retriever", _route_after_retriever, {"answerer": "answerer", "pubmed": "pubmed"})
     graph.add_edge("pubmed", "answerer")
     graph.add_edge("answerer", "verifier")
@@ -1143,10 +1206,11 @@ def _run_sequential(initial: dict) -> dict:
     if dest == "planner":
         state.update(planner_node(state))
         state.update(executor_node(state))
+    elif dest == "chart_read":
+        state.update(chart_read_node(state))
     elif dest == "pubmed":
         state.update(pubmed_node(state))
     else:
-        # chart_read / retriever 目前都临时走 retriever
         state.update(retriever_node(state))
         if _route_after_retriever(state) == "pubmed":
             state.update(pubmed_node(state))
