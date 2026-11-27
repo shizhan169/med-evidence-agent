@@ -43,7 +43,7 @@ QUESTIONS_FILE = ROOT / "eval" / "test_questions.md"
 RESULTS_JSON = ROOT / "eval" / "results.json"
 RESULTS_MD = ROOT / "eval" / "results.md"
 
-BLOCK_RE = re.compile(r"^###\s+(Q\d+|R\d+|FR\d+|F\d+)\s*$", re.M)
+BLOCK_RE = re.compile(r"^###\s+(Q\d+|R\d+|FR\d+|F\d+|T\d+)\s*$", re.M)
 FIELD_RE = re.compile(r"^(问题|类型|预期答案|预期来源|拒答原因)：(.*)$")
 SOURCE_RE = re.compile(r"^(.+\.pdf)\s+p\.(.+)$")  # 页码部分容忍 "3、p.5" / "3、5" 两种写法
 
@@ -62,7 +62,7 @@ def parse_questions(path: Path) -> list:
                 fields[m.group(1)] = m.group(2).strip()
         q = {
             "id": qid,
-            "section": "figure" if qid.startswith("F") else "original",
+            "section": "frozen" if qid.startswith("T") else ("figure" if qid.startswith("F") else "original"),
             "question": fields.get("问题", ""),
             "type": fields.get("类型", ""),
             "expected_answer": fields.get("预期答案", ""),

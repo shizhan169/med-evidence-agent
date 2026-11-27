@@ -157,7 +157,7 @@ def _run_with_fake_llm(monkeypatch, drafts):
         calls["n"] += 1
         return drafts[min(calls["n"] - 1, len(drafts) - 1)]
 
-    monkeypatch.setattr("app.rag.retrieve", lambda query, top_k=10: CHUNKS)
+    monkeypatch.setattr("app.rag.retrieve", lambda query, top_k=10, llm_call=None: CHUNKS)
     monkeypatch.setattr("app.agent._call_llm", fake_llm)
     return agent.run("总白质体积在几岁达到峰值？"), calls
 
@@ -192,7 +192,7 @@ def test_planning_branch_temporarily_falls_through_to_retriever(monkeypatch):
         calls["n"] += 1
         return ANSWER
 
-    monkeypatch.setattr("app.rag.retrieve", lambda query, top_k=10: CHUNKS)
+    monkeypatch.setattr("app.rag.retrieve", lambda query, top_k=10, llm_call=None: CHUNKS)
     monkeypatch.setattr("app.agent._call_llm", fake_llm)
     result = agent.run("比较五篇纵向常模论文的数据集有什么不同")
     assert result["answer_status"] == "verified"

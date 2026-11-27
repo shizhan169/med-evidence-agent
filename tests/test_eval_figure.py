@@ -14,18 +14,26 @@ PAPERS_DIR = ROOT / "data" / "papers"
 
 def test_parse_28_questions_original_untouched():
     qs = parse_questions(QUESTIONS_FILE)
-    assert len(qs) == 28
+    # 2.4 扩充后共 40 道：原 28 道 + 新增 12 道（Q16–Q23、R06–R07、F07–F08）
+    assert len(qs) == 40
     ids = [q["id"] for q in qs]
-    assert ids[:20] == [f"Q{i:02d}" for i in range(1, 16)] + [f"R{i:02d}" for i in range(1, 6)]
-    assert ids[20:] == ["F01", "F02", "F03", "F04", "F05", "F06", "FR01", "FR02"]
+    # 原 28 道题没动：相对顺序不变
+    orig_ids = ([f"Q{i:02d}" for i in range(1, 16)] + [f"R{i:02d}" for i in range(1, 6)]
+                + ["F01", "F02", "F03", "F04", "F05", "F06", "FR01", "FR02"])
+    assert [i for i in ids if i in orig_ids] == orig_ids
+    # 新增 12 道插在各自小节末尾
+    assert ids[15:23] == [f"Q{i:02d}" for i in range(16, 24)]
+    assert ids[28:30] == ["R06", "R07"]
+    assert ids[36:38] == ["F07", "F08"]
     # 原 20 道题没动：抽查 Q01、R05 的字段
-    q01 = qs[0]
+    by_id = {q["id"]: q for q in qs}
+    q01 = by_id["Q01"]
     assert q01["question"].startswith("Bethlehem 2022")
     assert q01["type"] == "可回答"
     assert q01["expected_file"] == "2022-bethlehem-brain-charts.pdf"
     assert q01["expected_pages"] == [1]
     assert q01["section"] == "original"
-    r05 = qs[19]
+    r05 = by_id["R05"]
     assert r05["question"] == "今天上海天气怎么样？"
     assert r05["type"] == "应拒答"
     assert r05["section"] == "original"
