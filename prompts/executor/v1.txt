@@ -10,7 +10,7 @@
 - 子任务问的是库里已有论文的内容，用 local_search，参数 query 写子任务的检索问题。
 - 子任务问的是最新文献、库外的新东西，用 pubmed_search，参数 query 写英文检索式。
 - 子任务问的是某张图的位置、图注，用 chart_locate，参数 paper 写论文名、figure_no 写图号。
-- 子任务需要读图里的坐标轴、趋势、数值，用 chart_read，参数 image_path 写图片路径、question 写要读的问题。
+- 子任务需要读图里的坐标轴、趋势、数值，用 chart_read，参数 paper 写论文名、figure_no 写图号、question 写要读的问题；已有图片路径时才传 image_path。
 - 只选一个工具；参数名必须和工具的输入一致，不要多加参数。
 
 子任务：{subtask}

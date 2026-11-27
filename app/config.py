@@ -42,6 +42,13 @@ def tracing_enabled():
     return LANGSMITH_TRACING == "true"
 
 
+# VLM 读图（第二阶段 2.3）：Qwen-VL，走 OpenAI 兼容接口（和 LLM 同一套 key）。
+# 默认走 DashScope 的 qwen-vl-plus；如果 LLM_BASE_URL 是 ModelScope，
+# 把 VLM_MODEL 改成 ModelScope 上有的 VL 模型（比如 Qwen/Qwen2.5-VL-72B-Instruct）。
+# VLM_BASE_URL 默认跟 LLM_BASE_URL 走；想让 VLM 单独走另一个服务再改它。
+VLM_MODEL = os.getenv("VLM_MODEL", "qwen-vl-plus")
+VLM_BASE_URL = os.getenv("VLM_BASE_URL", LLM_BASE_URL)
+
 # MCP PubMed 搜索（第 5 步，5a：只搜不下）。
 # 服务端是 @cyanheads/pubmed-mcp-server（npx 拉起，stdio 方式），版本钉死在
 # MCP_PUBMED_ARGS 里（2026-11-26 实测 2.12.4）。需要本机装 Node.js（npx 能跑）；

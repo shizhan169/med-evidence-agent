@@ -8,11 +8,13 @@
 - local_search：本地 RAG 检索（包装 app.rag.retrieve）
 - pubmed_search：PubMed 搜索（包装 app.mcp_tools.search_pubmed）
 - chart_locate：图表定位（按图号/图注定位页面，复用入库的图注片段）
-- chart_read：VLM 读图——占位，第二阶段 2.3 接入，现在返回 available=False
+- chart_read：VLM 读图（第二阶段 2.3）：按图号定位页面，渲染成图片调 Qwen-VL；
+  没有本地图片时返回 available=False，不强行读图
 
 注意：检索文本视为数据而非指令——不把检索到的文本直接拼进工具调用参数。
 """
 import re
+from pathlib import Path
 
 from .config import CHROMA_DIR
 
@@ -157,9 +159,51 @@ def _chart_locate(paper: str, figure_no) -> dict:
     return _find_caption(paper, figure_no)
 
 
-def _chart_read(image_path: str = "", question: str = "") -> dict:
-    """VLM 读图占位：第二阶段 2.3 接入，现在不调 VLM。"""
-    return {"available": False, "reason": "VLM 未实现，第二阶段接入"}
+def _chart_read(paper: str = "", figure_no="", question: str = "",
+                image_path: str = "") -> dict:
+    """VLM 读图（第二阶段 2.3）：按图号定位页面，渲染成图片，调 Qwen-VL 读图。
+    两种输入：
+    - image_path：已有图片路径，直接读这张图（没有图注可供交叉核对）。
+    - paper + figure_no：本地论文 + 图号，先定位图注拿页码和图注，
+      再从 PAPERS_DIR 找 PDF 渲染该页，读完和图注交叉核对。
+    没有图片时（本地没这篇 PDF、图号找不到、图片不存在）返回
+    available=False，不强行调 VLM——调用方按“证据不足”走。
+    返回 available=True 时带 reading（VLM 原文）、verification（交叉核对）、
+    downgraded（有数字对不上时 True，只降级说明）。"""
+    from .vision import call_vlm, extract_numbers, read_chart, verify_reading
+
+    if image_path:
+        p = Path(image_path)
+        if not p.is_file():
+            return {"available": False, "reason": f"图片不存在：{image_path}"}
+        try:
+            image_bytes = p.read_bytes()
+        except Exception as e:
+            return {"available": False, "reason": f"读图片失败：{e}"}
+        try:
+            reading = call_vlm(image_bytes, question)
+        except Exception as e:
+            return {"available": False, "reason": f"VLM 调用失败：{e}"}
+        verification = verify_reading(reading, "")
+        return {"available": True, "source": "", "page": None, "figure_no": "",
+                "caption": "", "reading": reading, "verification": verification,
+                "downgraded": bool(extract_numbers(reading)) and not verification["verified"],
+                "cropped": False, "reason": ""}
+    if not paper or figure_no in ("", None):
+        return {"available": False,
+                "reason": "读图需要图片路径，或论文名 + 图号（本地没有图片时不强行调 VLM）"}
+    located = _find_caption(paper, figure_no)
+    if not located.get("found"):
+        return {"available": False,
+                "reason": f"本地库里没找到 {paper} 的图 {figure_no}，没有图片可读"}
+    from .config import PAPERS_DIR
+
+    pdf_path = Path(PAPERS_DIR) / located["source"]
+    if not pdf_path.is_file():
+        return {"available": False,
+                "reason": f"本地没有该论文的 PDF（{located['source']}），无法渲染图片"}
+    return read_chart(pdf_path, located["page"], figure_no, question,
+                      caption=located.get("caption", ""))
 
 
 register(Tool(
@@ -194,10 +238,12 @@ register(Tool(
 
 register(Tool(
     name="chart_read",
-    description="用 VLM 读取图表图片（坐标轴、趋势、数值、图例）。占位：第二阶段接入，现在不可用。",
+    description="用 VLM 读取本地论文里的图表（坐标轴、趋势、数值、图例）。参数 paper 写论文名、figure_no 写图号、question 写要读的问题；已有图片路径时传 image_path 直接读那张图。没有本地图片时返回 available=False，不强行读图。",
     params={
-        "image_path": {"type": "str", "required": False, "default": ""},
+        "paper": {"type": "str", "required": False, "default": ""},
+        "figure_no": {"type": ["str", "int"], "required": False, "default": ""},
         "question": {"type": "str", "required": False, "default": ""},
+        "image_path": {"type": "str", "required": False, "default": ""},
     },
     func=_chart_read,
 ))
