@@ -6,7 +6,11 @@ router 的 planning 分支走真正的 planner；chart_read 节点还没实现�
 router 的 vision 分支这一步仍临时直通 retriever（见 _build_graph 的 TODO）。
 1.4：历史管理抽到 app/memory.py；历史超限时被截掉的轮次先摘要进
 State["history_summary"] 再丢，prompt 只拼最近 2 轮完整内容 + 摘要；
-checkpointer 里仍是最近 6 轮完整历史，压缩不影响持久化。"""
+checkpointer 里仍是最近 6 轮完整历史，压缩不影响持久化。1.5：核查员加
+失败归因（verify_failures：fabricated_citation / missing_citation /
+insufficient_evidence / llm_error）+ 部分回答（partial：只留已核实部分，
+标出未答的子任务）+ 只重跑失败的子任务（retry_target 决定回 executor
+还是 answerer）；PubMed 引用接受 PMID/DOI/摘要三种形式。"""
 import json
 import os
 import re
@@ -60,6 +64,13 @@ class State(TypedDict):
     # 核查重试：retries 是已重试次数，retry 是核查员要求再答一次的标志
     retries: int
     retry: bool
+    # 1.5 核查升级：verify_failures 是失败归因 [{subtask_id, reason}]，
+    # reason 是 fabricated_citation / missing_citation / insufficient_evidence /
+    # llm_error（subtask_id 为 "" 表示整篇答案级的问题，不归属到某个子任务）；
+    # retry_target 是重试去向（"executor" 只重跑失败的子任务，"answerer" 重答），
+    # 只在 retry 为真时有效
+    verify_failures: List[dict]
+    retry_target: str
     # PubMed（第 5 步）：pubmed_results 是本次 PubMed 返回的文章列表
     # [{pmid, title, authors, journal, year, abstract}]，没调 PubMed 时为空；
     # use_pubmed 是本轮是否允许调 PubMed（评测传 False，保证 28 道题数字不变）
@@ -69,6 +80,15 @@ class State(TypedDict):
 
 # PubMed 引用的格式：PubMed PMID:38395541（冒号后面可带空格，中文冒号也认）
 PMID_RE = re.compile(r"PubMed\s*PMID[:：]?\s*(\d+)")
+
+# PubMed 引用放宽（1.5）：除 PMID 外，DOI 和摘要引用也接受，不强制全文页码。
+# DOI 形如 DOI:10.1002/alz.14174；mcp_tools 只返回 pmid/title/authors/
+# journal/year/abstract，没有结构化 DOI 字段，所以 DOI 只认“出现在本次返回的
+# 标题/摘要文字里”的——编出来的 DOI 不在返回文字里，仍按编造处理。
+# 摘要引用指草稿里原样引用了某篇返回文章的摘要文字（连续 40 字以上）；
+# 摘要太短（<20 字）不认，避免一两个通用词就被当成引用。
+DOI_RE = re.compile(r"doi[:：]?\s*(10\.\d+/[^\s,;，。）\)\]]+)", re.IGNORECASE)
+MIN_ABSTRACT_QUOTE = 40
 
 
 # 多轮对话的历史上限（定义在 app/memory.py，这里 import 进来，旧测试读
@@ -637,80 +657,327 @@ def _append_turn_to_history(state: State, final: str) -> dict:
     return {"history": kept, "history_summary": new_summary}
 
 
-def _refusal_status(draft: str) -> str:
-    """拒答类收尾的状态：LLM 没调通（[待接 LLM]）是系统异常 error，
-    其余（没证据、模型主动拒答）是 refused。"""
-    return "error" if draft.startswith("[待接 LLM]") else "refused"
+# ---- 1.5 核查升级：失败归因、部分回答、只重跑失败的子任务 ----
+
+def _norm_text(text: str) -> str:
+    """摘要引用比对用的归一：小写、空白折叠。"""
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
 
 
-def _verification_failed(state: State, reason: str) -> dict:
-    """核查失败的统一收尾：打印原因；还有重试次数就回回答员重答，
+def _abstract_windows(pubmed_results: list):
+    """从本次 PubMed 返回的每篇文章摘要里切出 40 字的窗口（步长 5），
+    返回 [(窗口, pmid)]。草稿里出现任一窗口，就算引用了该篇的摘要。
+    摘要太短（<20 字）不切，避免通用短语被当成引用。"""
+    windows = []
+    for r in pubmed_results or []:
+        abstract = _norm_text(r.get("abstract", ""))
+        if len(abstract) < 20:
+            continue
+        pmid = str(r.get("pmid", ""))
+        if len(abstract) <= MIN_ABSTRACT_QUOTE:
+            windows.append((abstract, pmid))
+            continue
+        for i in range(0, len(abstract) - MIN_ABSTRACT_QUOTE + 1, 5):
+            windows.append((abstract[i:i + MIN_ABSTRACT_QUOTE], pmid))
+    return windows
+
+
+def _abstract_cited_pmids(draft: str, windows) -> set:
+    """草稿里原样引用了哪些文章的摘要（按窗口匹配）。"""
+    norm_draft = _norm_text(draft)
+    return {pmid for w, pmid in windows if w and w in norm_draft}
+
+
+def _pubmed_refs(draft: str, pubmed_results: list):
+    """PubMed 路径的引用提取。返回 (cited_pmids, cited_dois, abstract_pmids)：
+    cited_pmids 是 PubMed PMID:xxx 形式的；cited_dois 是 DOI:10.xxx 形式的
+    （归一小写）；abstract_pmids 是草稿里原样引用了其摘要文字的文章 PMID。"""
+    cited_pmids = set(PMID_RE.findall(draft or ""))
+    cited_dois = {d.lower() for d in DOI_RE.findall(draft or "")}
+    windows = _abstract_windows(pubmed_results)
+    abstract_pmids = _abstract_cited_pmids(draft, windows)
+    return cited_pmids, cited_dois, abstract_pmids
+
+
+def _doi_in_returned(dois: set, pubmed_results: list) -> set:
+    """哪些 DOI 出现在本次 PubMed 返回的标题/摘要文字里（即可接受的 DOI）。"""
+    text = " ".join(
+        _norm_text(f"{r.get('title', '')} {r.get('abstract', '')}")
+        for r in pubmed_results or []
+    )
+    return {d for d in dois if d in text}
+
+
+def _local_evidence_pool(chunks: list):
+    """本地证据池：{(source, page)}，以及 {source} 文件名集合。"""
+    cites = set()
+    sources = set()
+    for c in chunks or []:
+        sources.add(str(c.get("source", "未知")))
+        cites.add((str(c.get("source", "未知")), str(c.get("page", "?"))))
+    return cites, sources
+
+
+def _parse_evidence_id(eid: str):
+    """把子任务的 evidence_id 还原成可核对的形式：
+    - "paper.pdf p.3" → ("local", source, page)
+    - "38395541"（纯数字）→ ("pmid", pmid)
+    - 其他（chart_locate 的文件名）→ ("source", filename)：图注定位工具
+      本身成功就是证据（它不产生检索片段，进不了 chunks 池），直接认。"""
+    s = str(eid)
+    m = re.match(r"^(.*) p\.(\?|\d+)$", s)
+    if m:
+        return ("local", m.group(1), m.group(2))
+    if s.strip().isdigit():
+        return ("pmid", s.strip())
+    return ("source", s)
+
+
+def _check_subtasks(subtasks, local_cites, chunk_sources, real_pmids):
+    """逐个子任务核查证据。返回 (verified_ids, failures)：
+    verified 的条件：status == "completed"，且 evidence_ids 非空、且每条都
+    能在证据池里找到（本地 (source, page)、PMID；chart_locate 的文件名直接认）。
+    其余（insufficient_evidence / failed / pending / running、或 evidence_ids
+    为空、或证据不在池里）→ insufficient_evidence。
+    注意：failed / insufficient 的子任务 evidence_ids 本来就是空的（Executor
+    只在工具成功时填 evidence_ids），所以“证据不在池里”实际只发生在
+    completed 但 evidence 被漏掉的极端情况。"""
+    verified = set()
+    failures = []
+    for st in subtasks or []:
+        tid = st.get("task_id", "")
+        if st.get("status") != "completed":
+            failures.append({"subtask_id": tid, "reason": "insufficient_evidence"})
+            continue
+        eids = st.get("evidence_ids") or []
+        if not eids:
+            failures.append({"subtask_id": tid, "reason": "insufficient_evidence"})
+            continue
+        ok = True
+        for eid in eids:
+            kind, *rest = _parse_evidence_id(eid)
+            if kind == "local":
+                if (rest[0], rest[1]) not in local_cites:
+                    ok = False
+                    break
+            elif kind == "pmid":
+                if rest[0] not in real_pmids:
+                    ok = False
+                    break
+            # ("source", ...) 是 chart_locate 的文件名：工具成功即证据，直接认
+        if ok:
+            verified.add(tid)
+        else:
+            failures.append({"subtask_id": tid, "reason": "insufficient_evidence"})
+    return verified, failures
+
+
+def _verified_evidence_keys(subtasks, verified_ids):
+    """已核实子任务的证据键：本地 {(source, page)}、PubMed {pmid}。
+    partial 过滤句子时用：只留引用全在这个集合里的句子。"""
+    local_keys = set()
+    pmid_keys = set()
+    by_id = {st.get("task_id"): st for st in subtasks or []}
+    for tid in verified_ids:
+        for eid in (by_id.get(tid) or {}).get("evidence_ids") or []:
+            kind, *rest = _parse_evidence_id(eid)
+            if kind == "local":
+                local_keys.add((rest[0], rest[1]))
+            elif kind == "pmid":
+                pmid_keys.add(rest[0])
+    return local_keys, pmid_keys
+
+
+def _filter_partial_draft(draft, verified_local, verified_pmids, is_pubmed, windows):
+    """partial 答案只留已核实的部分：按句过滤。
+    保留：一句里的引用全在已核实证据集合里（本地 (source, page)；PubMed PMID）。
+    DOI/摘要引用无法归属到具体子任务，全局核查已通过就保留。
+    没引用的句子没法归属到已核实的子任务，去掉。
+    过滤完是空的就原样返回（防御性：能进 partial 说明至少一个子任务已核实，
+    而草稿的引用都已通过全局核查，正常到不了这里）。"""
+    sentences = [s for s in re.split(r"(?<=[。！？；\n])", draft or "") if s.strip()]
+    kept = []
+    for s in sentences:
+        if is_pubmed:
+            pmids = PMID_RE.findall(s)
+            if pmids:
+                if all(p in verified_pmids for p in pmids):
+                    kept.append(s)
+                continue
+            # 没 PMID：DOI 引用或摘要引用（全局已核查通过）就保留，否则去掉
+            norm_s = _norm_text(s)
+            if DOI_RE.search(s) or any(w and w in norm_s for w, _ in windows):
+                kept.append(s)
+        else:
+            cites = [(m.group(1), m.group(2)) for m in CITE_RE.finditer(s)]
+            if cites and all(c in verified_local for c in cites):
+                kept.append(s)
+    if not kept:
+        return draft
+    return "".join(kept)
+
+
+def _partial_note(failed_subtasks):
+    """partial 答案末尾的标注：哪些子任务因证据不足没答（用子任务的 query 点名）。"""
+    items = [st.get("query", "") for st in failed_subtasks if st.get("query")]
+    if not items:
+        return "\n\n【部分回答】部分内容因证据不足，本次未作回答。"
+    return "\n\n【部分回答】以下内容因证据不足，本次未作回答：" + "；".join(items)
+
+
+def _retry_failed_subtasks(state, failed_ids):
+    """把失败的子任务重置为 pending（只重跑失败的，通过的不动），retry_count +1。
+    返回 (更新后的 subtasks 列表, 被重置的 task_id 列表)。
+    retry_count 已用完（>= MAX_SUBTASK_RETRIES）的子任务不重置——它没重试额度了。"""
+    out = []
+    reset = []
+    for st in state.get("subtasks") or []:
+        s = dict(st)
+        if s.get("task_id") in failed_ids and s.get("retry_count", 0) < MAX_SUBTASK_RETRIES:
+            s["status"] = "pending"
+            s["retry_count"] = s.get("retry_count", 0) + 1
+            reset.append(s.get("task_id"))
+        out.append(s)
+    return out, reset
+
+
+def _verification_failed(state: State, reason: str, failures, retry_target="answerer") -> dict:
+    """核查失败的统一收尾：记失败归因（verify_failures）；还有重试次数就按
+    retry_target 回去（answerer 重答 / executor 只重跑失败的子任务），
     用完就拒答——绝不编造。重试时 answer_status 还没定论（不写），
-    最终定论时由 verifier 填 verified / refused。"""
+    最终定论时由 verifier 填 verified / partial / refused / error。
+    注意：引用编造/缺失走 answerer（生成问题，重答能修）；子任务证据不足
+    走 executor（证据问题，重答修不了，得重新检索）——两类失败的重试去向不同。"""
     print(f"[verifier] {reason}")
     retries = state.get("retries", 0)
     if retries < MAX_RETRIES:
-        return {"final": "", "retry": True, "retries": retries + 1}
+        return {"final": "", "retry": True, "retry_target": retry_target,
+                "retries": retries + 1, "verify_failures": failures}
     return {"final": REFUSAL, "answer_status": "refused", "retry": False,
+            "retry_target": "", "verify_failures": failures,
             **_append_turn_to_history(state, REFUSAL)}
 
 
-def _verify_pubmed(state: State, draft: str, pubmed_results: list) -> dict:
-    """PubMed 路径的核查：答案里的每个 PMID 必须在本次 PubMed 返回的列表里，
-    且不许出现本地式引用（[来源：论文名 p.页码]）——两种引用体系不混用。
-    假 PMID（工具没返回过）按引用编造处理，走重试/拒答。"""
-    cited_pmids = set(PMID_RE.findall(draft))
-    real_pmids = {str(r.get("pmid", "")) for r in pubmed_results}
-    local_cites = list(CITE_RE.finditer(draft))
-    if not cited_pmids:
-        return _verification_failed(state, "回答没有给出 PMID 引用")
-    if not cited_pmids.issubset(real_pmids):
-        bad = sorted(cited_pmids - real_pmids)
-        return _verification_failed(state, f"引用的 PMID 不在本次 PubMed 返回结果中：{bad}")
-    if local_cites:
-        return _verification_failed(state, "PubMed 回答里混入了本地式引用")
-    return {"final": draft, "answer_status": "verified", "retry": False,
-            **_append_turn_to_history(state, draft)}
-
-
 def verifier_node(state: State):
-    # 核查规则：draft 里的每个 [来源：... p.X] 必须对应一个真实检索片段，否则拒答
+    """核查员（1.5）：引用存在性 + 子任务证据逐项核查 + 失败归因。
+    顺序：终态（拒答/LLM 异常/无证据）→ 引用核查 → 子任务核查 → 定论。
+    - 引用编造/缺失是生成问题：回 answerer 重答（提醒只引用本次提供的依据）。
+    - 子任务证据不足是证据问题：回 executor 只重跑失败的子任务（通过的不动），
+      每个子任务最多重试 1 次（复用 1.2 的 retry_count），整体重试上限 2 次。
+    - 预算用完：有已核实的子任务 → partial（只留已核实部分，标出未答部分）；
+      一个都没通过 → refused。error（LLM 没调通）与 refused（文献没依据）区分。
+    注意：核查只看 draft 引用 vs chunks/pubmed_results，不读 history_summary——
+    摘要只是 prompt 里的上下文入口，不是用户原话，不参与引用校验。"""
     draft = state.get("draft", "")
     pubmed_results = state.get("pubmed_results") or []
-    if pubmed_results:
-        # PubMed 路径：只核查 PMID；回答员本来就拒答、LLM 没调通时不重试
-        if draft == REFUSAL or draft.startswith("[待接 LLM]"):
-            final = draft
-            return {"final": final, "answer_status": _refusal_status(draft), "retry": False,
-                    **_append_turn_to_history(state, final)}
-        return _verify_pubmed(state, draft, pubmed_results)
-    if not state.get("chunks") or draft == REFUSAL or draft.startswith("[待接 LLM]"):
-        # 没片段、回答员本来就拒答、LLM 没调通：重试也没用，直接结束
-        final = REFUSAL if not state.get("chunks") else draft
-        return {"final": final, "answer_status": _refusal_status(final), "retry": False,
-                **_append_turn_to_history(state, final)}
-    cited = set((m.group(1), m.group(2)) for m in CITE_RE.finditer(draft))
-    real = set(
-        (str(c.get("source", "未知")), str(c.get("page", "?"))) for c in state["chunks"]
-    )
-    if not cited or not cited.issubset(real):
-        # 引用错了（编了页码、或没给引用）：还有重试次数就回回答员重答，
-        # 用完就拒答——绝不编造
+    chunks = state.get("chunks") or []
+    subtasks = state.get("subtasks") or []
+
+    # --- 终态：不用重试 ---
+    if draft == REFUSAL:
+        # 回答员主动拒答：正确收尾，不是失败
+        return {"final": draft, "answer_status": "refused", "retry": False,
+                "retry_target": "", "verify_failures": [],
+                **_append_turn_to_history(state, draft)}
+    if draft.startswith("[待接 LLM]"):
+        # LLM 没调通：系统异常 error（不是知识不足的 refused），不重试
+        failures = [{"subtask_id": "", "reason": "llm_error"}]
+        return {"final": draft, "answer_status": "error", "retry": False,
+                "retry_target": "", "verify_failures": failures,
+                "error": "LLM 调用失败",
+                **_append_turn_to_history(state, draft)}
+    if not chunks and not pubmed_results:
+        # 完全没证据：拒答（回答员这时本来就该返回 REFUSAL；防御性收尾）
+        return {"final": REFUSAL, "answer_status": "refused", "retry": False,
+                "retry_target": "", "verify_failures": [],
+                **_append_turn_to_history(state, REFUSAL)}
+
+    # --- 引用核查（路径不同，规则不同）---
+    is_pubmed = bool(pubmed_results)
+    if is_pubmed:
+        # PubMed 路径：引用接受 PMID、DOI、摘要三种形式，不强制全文页码；
+        # 假 PMID、假 DOI、混入本地式引用仍按编造处理。
+        real_pmids = {str(r.get("pmid", "")) for r in pubmed_results}
+        cited_pmids, cited_dois, abstract_pmids = _pubmed_refs(draft, pubmed_results)
+        if list(CITE_RE.finditer(draft)):
+            return _verification_failed(
+                state, "PubMed 回答里混入了本地式引用",
+                [{"subtask_id": "", "reason": "fabricated_citation"}])
+        bad_pmids = sorted(cited_pmids - real_pmids)
+        if bad_pmids:
+            return _verification_failed(
+                state, f"引用的 PMID 不在本次 PubMed 返回结果中：{bad_pmids}",
+                [{"subtask_id": "", "reason": "fabricated_citation"}])
+        bad_dois = sorted(cited_dois - _doi_in_returned(cited_dois, pubmed_results))
+        if bad_dois:
+            return _verification_failed(
+                state, f"引用的 DOI 不在本次 PubMed 返回结果中：{bad_dois}",
+                [{"subtask_id": "", "reason": "fabricated_citation"}])
+        if not cited_pmids and not cited_dois and not abstract_pmids:
+            return _verification_failed(
+                state, "回答没有给出引用（PMID/DOI/摘要）",
+                [{"subtask_id": "", "reason": "missing_citation"}])
+    else:
+        # 本地路径：每个 [来源：... p.X] 必须对应一个真实检索片段
+        cited = set((m.group(1), m.group(2)) for m in CITE_RE.finditer(draft))
+        local_cites, _ = _local_evidence_pool(chunks)
         if not cited:
-            return _verification_failed(state, "回答没有给出引用")
-        bad = sorted(cited - real)
-        return _verification_failed(state, f"引用不在检索结果中：{bad}")
-    return {"final": draft, "answer_status": "verified", "retry": False,
-            **_append_turn_to_history(state, draft)}
+            return _verification_failed(
+                state, "回答没有给出引用",
+                [{"subtask_id": "", "reason": "missing_citation"}])
+        if not cited.issubset(local_cites):
+            bad = sorted(cited - local_cites)
+            return _verification_failed(
+                state, f"引用不在检索结果中：{bad}",
+                [{"subtask_id": "", "reason": "fabricated_citation"}])
+
+    # --- 子任务证据核查（有子任务时才做；简单问答没子任务，引用对了就通过）---
+    if not subtasks:
+        return {"final": draft, "answer_status": "verified", "retry": False,
+                "retry_target": "", "verify_failures": [],
+                **_append_turn_to_history(state, draft)}
+    local_cites, chunk_sources = _local_evidence_pool(chunks)
+    real_pmids = {str(r.get("pmid", "")) for r in pubmed_results}
+    verified_ids, sub_failures = _check_subtasks(subtasks, local_cites, chunk_sources, real_pmids)
+    if not sub_failures:
+        return {"final": draft, "answer_status": "verified", "retry": False,
+                "retry_target": "", "verify_failures": [],
+                **_append_turn_to_history(state, draft)}
+
+    # 有子任务失败：还能重试就只重跑失败的（通过的不动）；预算用完就定论
+    by_id = {st.get("task_id"): st for st in subtasks}
+    failed_ids = [f["subtask_id"] for f in sub_failures]
+    retryable = [tid for tid in failed_ids
+                 if (by_id.get(tid) or {}).get("retry_count", 0) < MAX_SUBTASK_RETRIES]
+    if retryable and state.get("retries", 0) < MAX_RETRIES:
+        new_subtasks, reset = _retry_failed_subtasks(state, set(retryable))
+        print(f"[verifier] 子任务证据不足，只重跑失败的：{reset}")
+        return {"final": "", "retry": True, "retry_target": "executor",
+                "retries": state.get("retries", 0) + 1,
+                "subtasks": new_subtasks, "verify_failures": sub_failures}
+    if verified_ids:
+        # 部分通过 → partial：只留已核实部分，标出未答的子任务
+        failed_sts = [by_id[tid] for tid in failed_ids if tid in by_id]
+        verified_local, verified_pmids = _verified_evidence_keys(subtasks, verified_ids)
+        windows = _abstract_windows(pubmed_results) if is_pubmed else []
+        kept = _filter_partial_draft(draft, verified_local, verified_pmids, is_pubmed, windows)
+        final = kept + _partial_note(failed_sts)
+        return {"final": final, "answer_status": "partial", "retry": False,
+                "retry_target": "", "verify_failures": sub_failures,
+                **_append_turn_to_history(state, final)}
+    # 一个子任务都没通过：拒答
+    return {"final": REFUSAL, "answer_status": "refused", "retry": False,
+            "retry_target": "", "verify_failures": sub_failures,
+            **_append_turn_to_history(state, REFUSAL)}
 
 
 def _route_after_verifier(state: State) -> str:
-    """核查后的走向：通过（verified/partial）就结束；要求重试就回回答员；
-    否则结束（拒答/异常）。partial 这一步还不会出现（1.5 再做），先写上。"""
+    """核查后的走向：通过（verified/partial）就结束；要求重试就按 retry_target
+    回去（executor 只重跑失败的子任务，answerer 重答）；否则结束。"""
     if state.get("answer_status") in ("verified", "partial"):
         return "end"
     if state.get("retry"):
-        return "answerer"
+        return state.get("retry_target") or "answerer"
     return "end"
 
 
@@ -788,7 +1055,9 @@ def _build_graph(checkpointer=None):
     graph.add_conditional_edges("retriever", _route_after_retriever, {"answerer": "answerer", "pubmed": "pubmed"})
     graph.add_edge("pubmed", "answerer")
     graph.add_edge("answerer", "verifier")
-    graph.add_conditional_edges("verifier", _route_after_verifier, {"answerer": "answerer", "end": END})
+    # 1.5：核查失败的重试有两个去向——引用错回 answerer 重答，子任务证据不足
+    # 回 executor 只重跑失败的子任务（retry_target 由 verifier 定）。
+    graph.add_conditional_edges("verifier", _route_after_verifier, {"answerer": "answerer", "executor": "executor", "end": END})
     return graph.compile(checkpointer=checkpointer)
 
 
@@ -828,8 +1097,10 @@ def _to_response(result: dict) -> dict:
     # answer_status 是最终状态；verified 是兼容字段（旧调用方读它），
     # 只有 answer_status == "verified" 时为 True，其余一律 False。
     # answer_status 为空（还没定论就不该到这一步）时按 refused 处理。
+    # verify_failures 是 1.5 的失败归因 [{subtask_id, reason}]，没有失败时为空列表。
     answer_status = result.get("answer_status") or "refused"
     verified = answer_status == "verified"
+    verify_failures = result.get("verify_failures") or []
     pubmed_results = result.get("pubmed_results") or []
     if pubmed_results:
         return {
@@ -837,12 +1108,14 @@ def _to_response(result: dict) -> dict:
             "verified": verified,
             "answer_status": answer_status,
             "citations": _dedupe_pubmed_citations(pubmed_results),
+            "verify_failures": verify_failures,
         }
     return {
         "answer": result.get("final", REFUSAL),
         "verified": verified,
         "answer_status": answer_status,
         "citations": _dedupe_citations(result.get("chunks", [])),
+        "verify_failures": verify_failures,
     }
 
 
@@ -866,6 +1139,9 @@ def _run_sequential(initial: dict) -> dict:
         state.update(verifier_node(state))
         if state.get("answer_status") in ("verified", "partial") or not state.get("retry"):
             break
+        if state.get("retry_target") == "executor":
+            # 子任务证据不足：只重跑失败的子任务，再回回答员重新汇总
+            state.update(executor_node(state))
     return state
 
 
@@ -882,7 +1158,7 @@ def _run_with_graph(query: str, history=None, use_pubmed: bool = True) -> dict:
         "query": query, "chunks": [], "draft": "", "final": "", "answer_status": "",
         "route": {}, "plan": {}, "subtasks": [], "tool_calls": [], "figure": {}, "error": "",
         "history": history, "history_summary": history_summary, "retrieval_query": retrieval_query,
-        "retries": 0, "retry": False,
+        "retries": 0, "retry": False, "verify_failures": [], "retry_target": "",
         "pubmed_results": [], "use_pubmed": use_pubmed,
     }
     try:
@@ -927,7 +1203,7 @@ def run(query: str, history=None, thread_id=None, use_pubmed: bool = True) -> di
                         "query": query, "chunks": [], "draft": "", "final": "", "answer_status": "",
                         "route": {}, "plan": {}, "subtasks": [], "tool_calls": [], "figure": {}, "error": "",
                         "history": history, "history_summary": history_summary, "retrieval_query": retrieval_query,
-                        "retries": 0, "retry": False,
+                        "retries": 0, "retry": False, "verify_failures": [], "retry_target": "",
                         "pubmed_results": [], "use_pubmed": use_pubmed,
                     }
                     result = graph.invoke(initial, config=config)
