@@ -27,7 +27,7 @@ ANSWER = "总白质体积在 28.7 岁达到峰值 [来源：2022-bethlehem-brain
 def _setup(monkeypatch, tmp_path):
     """假检索 + 假 LLM + checkpointer 指到临时文件。"""
     monkeypatch.setattr("app.agent.CHECKPOINTS_DB", str(tmp_path / "ckpt.db"))
-    monkeypatch.setattr("app.rag.retrieve", lambda query, top_k=10: CHUNKS)
+    monkeypatch.setattr("app.rag.retrieve", lambda query, top_k=10, llm_call=None: CHUNKS)
     monkeypatch.setattr("app.agent._call_llm", lambda prompt: ANSWER)
 
 

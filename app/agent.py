@@ -340,21 +340,25 @@ def _normalize_history(history) -> List[dict]:
 
 
 def _build_retrieval_query(query: str, history: List[dict]) -> str:
-    """给检索用的问题。追问（带指代词）就把上一轮用户的问题拼在前面，
-    让检索能看到完整意思；普通问题原样返回，不加东西。"""
-    if history and any(m in query for m in FOLLOWUP_MARKERS):
-        for msg in reversed(history):
-            if msg["role"] == "user":
-                return f"{msg['content']} {query}"
-    return query
+    """给检索用的问题。追问（带指代词）先改写成完整独立的问题（指代消解、
+    省略补全，见 rag.rewrite_query_for_retrieval），改写后的问题才拿去检索；
+    普通问题原样返回，不加东西。改写调一次 LLM，失败时退回老做法（把上
+    一轮用户问题拼在前面）。中文翻英文不在这里做——检索时 retrieve() 内
+    部再翻向量检索词，这样 PubMed 路径的 _to_pubmed_query 仍能拿到中文
+    原问题做 OR 拓宽。"""
+    from .rag import rewrite_query_for_retrieval
+
+    return rewrite_query_for_retrieval(query, history, llm_call=_call_llm)
 
 
 def retriever_node(state: State):
     from .rag import retrieve
 
-    # 追问已经由 _build_retrieval_query 拼好了完整意思，检索用它；
-    # 没历史时 retrieval_query 就是原问题
-    chunks = retrieve(state.get("retrieval_query") or state["query"], top_k=10)
+    # 追问已经由 _build_retrieval_query 改写成完整意思，检索用它；
+    # 没历史时 retrieval_query 就是原问题。把 _call_llm 传给 retrieve，
+    # 让它在内部把中文问题翻成英文再查向量（跨语言向量检索弱，Q09 的教训）；
+    # 没 key 时 _call_llm 返回空，翻译退回原问题，检索不断。
+    chunks = retrieve(state.get("retrieval_query") or state["query"], top_k=10, llm_call=_call_llm)
     return {"chunks": chunks}
 
 

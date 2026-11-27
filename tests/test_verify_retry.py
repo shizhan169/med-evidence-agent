@@ -17,7 +17,7 @@ import app.agent as agent
 CHUNKS = [{"text": "总白质体积在 28.7 岁达到峰值。", "source": "2022-bethlehem-brain-charts.pdf", "page": 3}]
 
 
-def _fake_retrieve(query, top_k=10):
+def _fake_retrieve(query, top_k=10, llm_call=None):
     return CHUNKS
 
 
@@ -90,7 +90,7 @@ def test_no_chunks_no_retry(monkeypatch):
         calls["n"] += 1
         return "不该被调用"
 
-    monkeypatch.setattr("app.rag.retrieve", lambda query, top_k=10: [])
+    monkeypatch.setattr("app.rag.retrieve", lambda query, top_k=10, llm_call=None: [])
     monkeypatch.setattr("app.agent._call_llm", fake_llm)
     result = agent.run("总白质体积在几岁达到峰值？", use_pubmed=False)
     assert calls["n"] == 0
