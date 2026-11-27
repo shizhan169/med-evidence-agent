@@ -1,0 +1,9 @@
+# 冻结测试集：5 篇（FROZEN — 只用来阶段验收，不用来调参、不用来写开发题）
+
+# 冻结规则：分集定下来之后，这 5 篇的 10 道测试题（每篇 2 道）只跑一次验收；
+# 开发过程中不准拿这 5 篇的题调检索、改 prompt、改阈值。违反即测试集失效。
+2024-verdi-personalizing-progressive-changes-alzheimers.pdf
+2021-dimitrova-phenotyping-preterm-brain.pdf
+2022-bayer-site-variation-normative-models.pdf
+2018-wolfers-heterogeneous-phenotype-schizophrenia-bipolar.pdf
+2025-parker-generalizable-mri-normative-modelling.pdf

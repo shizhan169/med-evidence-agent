@@ -1,4 +1,9 @@
-"""LangGraph 三角色：检索员 -> 回答员 -> 核查员。轻量版多智能体。"""
+"""LangGraph 三角色：检索员 -> 回答员 -> 核查员。轻量版多智能体。
+框架 v2 第一阶段 1.1：入口加了 Router 节点（结构化路由），State 加了
+route / plan / subtasks / tool_calls / figure / error，verified 改名
+answer_status（四种最终状态）。planner / chart_read 节点还没实现，
+router 的那两个分支这一步先临时直通 retriever（见 _build_graph 的 TODO）。"""
+import json
 import os
 import re
 from typing import TypedDict, List
@@ -18,7 +23,25 @@ class State(TypedDict):
     chunks: List[dict]
     draft: str
     final: str
-    verified: bool
+    # 最终状态（原 verified 布尔字段改名）：verified / partial / refused / error。
+    # verified 字段保留在 _to_response 的返回里（从 answer_status 派生），
+    # 旧调用方（eval、Streamlit、/ask）读 verified 不受影响。
+    # 初始值是 ""（还没定论）；verifier 会在定论时填上四种之一。
+    answer_status: str
+    # 路由（1.1）：Router 的结构化输出 {task_type, requires_planning,
+    # requires_external_search, requires_vision}
+    route: dict
+    # 规划（1.2 预留）：Planner 的总体计划；subtasks 是结构化子任务列表，
+    # 这一步先留空，Planner 在下一步填
+    plan: dict
+    subtasks: List[dict]
+    # 工具调用记录（1.3）：[{tool, params, result, success, error}]
+    tool_calls: List[dict]
+    # 图表信息（2.3 预留）：{paper, page, figure_no, image_path, caption}，
+    # 这一步先留空
+    figure: dict
+    # 系统异常信息（answer_status=error 时填）
+    error: str
     # 多轮对话：history 是最近几轮 [{"role": "user"/"assistant", "content": ...}]，
     # retrieval_query 是真正拿去检索的问题（追问会被拼上上文，见 _build_retrieval_query）
     history: List[dict]
@@ -73,6 +96,111 @@ def _asks_new_literature(query: str) -> bool:
         return True
     ql = q.lower()
     return any(m in ql for m in NEW_LITERATURE_MARKERS_EN)
+
+
+# Router（框架 v2，第一阶段 1.1）：输出结构化路由，不是 4 选 1。
+# {task_type: "simple"|"complex", requires_planning, requires_external_search, requires_vision}
+# 三个布尔 flag 可组合。规则明确时直接分类；规则覆盖不了时调 LLM 分类；
+# 没有“其余 → single_doc”兜底——规则覆盖不了的必须走 LLM，否则 LLM
+# 兜底永远触发不了。LLM 也调不通时（没 key），退回简单事实问答（retriever）。
+ROUTER_PROMPT = load_prompt("router", "v1")
+
+# 规则分类的标志词：
+# - 规划：比较/对比/多篇——需要拆解或综合（英文 whole-word 用小写匹配）
+# - 读图：图 N / Figure N / Fig. N / 表 N / Table N
+# - 外部搜索：复用 _asks_new_literature（最新/最近/新文献……）
+PLANNING_MARKERS = ("比较", "对比", "五篇", "多篇", "几篇", "分别", "异同", "区别")
+PLANNING_MARKERS_EN = ("compare", "contrast", "multiple papers", "several papers", "across papers", "across studies")
+FIGURE_RE = re.compile(r"(?:图|Figure|Fig\.|表|Table)\s*(\d+)", re.IGNORECASE)
+
+# “明显是简单事实问答”的判断：问的是一个具体事实（什么/几岁/多少/哪个……），
+# 且没有推理词（为什么/怎么/如何/是否……）。只有这种才直接走 simple；
+# 不满足的、规则又覆盖不了的，一律走 LLM 分类。
+FACTOID_MARKERS = ("什么", "几岁", "多少", "哪个", "哪篇", "是谁", "哪里", "何时", "几年", "多大")
+REASONING_MARKERS = ("为什么", "怎么", "如何", "是否", "能否", "可靠", "评价", "分析", "原因", "机制", "影响", "优缺点")
+
+
+def _empty_route() -> dict:
+    """默认路由：简单事实问答（单步可答，不规划、不搜外部、不读图）。"""
+    return {"task_type": "simple", "requires_planning": False,
+            "requires_external_search": False, "requires_vision": False}
+
+
+def _classify_by_rules(query: str) -> dict | None:
+    """规则分类：规则明确时返回路由；规则覆盖不了时返回 None（走 LLM）。
+    三个 flag 各自独立判断，可组合；task_type 由 requires_planning 决定。"""
+    q = query or ""
+    ql = q.lower()
+    requires_planning = any(m in q for m in PLANNING_MARKERS) or any(m in ql for m in PLANNING_MARKERS_EN)
+    requires_external = _asks_new_literature(q)
+    requires_vision = bool(FIGURE_RE.search(q))
+    if requires_planning or requires_external or requires_vision:
+        return {
+            "task_type": "complex" if requires_planning else "simple",
+            "requires_planning": requires_planning,
+            "requires_external_search": requires_external,
+            "requires_vision": requires_vision,
+        }
+    # 没有任何标志：是“明显简单事实问答”就直接 simple，否则交给 LLM 判断
+    is_factoid = any(m in q for m in FACTOID_MARKERS)
+    has_reasoning = any(m in q for m in REASONING_MARKERS)
+    if is_factoid and not has_reasoning:
+        return _empty_route()
+    return None
+
+
+def _classify_by_llm(query: str) -> dict:
+    """LLM 分类：规则覆盖不了时调 LLM。输出解析失败、LLM 没调通时，
+    退回简单事实问答（retriever）——分类失败不断问答。"""
+    try:
+        raw = _call_llm(ROUTER_PROMPT.format(query=query))
+    except Exception as e:
+        print(f"[router] LLM 分类失败（{e}），退回简单问答")
+        return _empty_route()
+    if not raw:
+        return _empty_route()
+    try:
+        m = re.search(r"\{.*\}", raw, re.S)
+        data = json.loads(m.group(0)) if m else {}
+    except Exception as e:
+        print(f"[router] 分类结果解析失败（{e}），退回简单问答")
+        return _empty_route()
+    route = _empty_route()
+    for key in ("requires_planning", "requires_external_search", "requires_vision"):
+        if isinstance(data.get(key), bool):
+            route[key] = data[key]
+    if data.get("task_type") in ("simple", "complex"):
+        route["task_type"] = data["task_type"]
+    elif route["requires_planning"]:
+        route["task_type"] = "complex"
+    return route
+
+
+def router_node(state: State):
+    """Router 节点：先规则分类，规则覆盖不了再调 LLM 分类；
+    结果写进 State["route"]，供条件边分流。"""
+    query = state.get("query", "")
+    route = _classify_by_rules(query)
+    if route is None:
+        route = _classify_by_llm(query)
+    print(f"[router] {query} → {route}")
+    return {"route": route}
+
+
+def _route_after_router(state: State) -> str:
+    """router 之后的分流，优先级：planning → vision → 外部搜索 → 本地检索。
+    返回的是逻辑目的地（"planner"/"chart_read"/"pubmed"/"retriever"），
+    图里的映射把还没实现的节点临时直通 retriever（见 _build_graph 的 TODO）。
+    use_pubmed=False（评测）时不走 PubMed——评测的 28 道题测本地 RAG，
+    外部搜索开关关了，路由也不触发。"""
+    route = state.get("route") or {}
+    if route.get("requires_planning"):
+        return "planner"
+    if route.get("requires_vision"):
+        return "chart_read"
+    if route.get("requires_external_search") and state.get("use_pubmed", True):
+        return "pubmed"
+    return "retriever"
 
 
 def _to_pubmed_query(query: str) -> str:
@@ -294,14 +422,21 @@ def _append_turn_to_history(state: State, final: str) -> List[dict]:
     return _normalize_history(history)
 
 
+def _refusal_status(draft: str) -> str:
+    """拒答类收尾的状态：LLM 没调通（[待接 LLM]）是系统异常 error，
+    其余（没证据、模型主动拒答）是 refused。"""
+    return "error" if draft.startswith("[待接 LLM]") else "refused"
+
+
 def _verification_failed(state: State, reason: str) -> dict:
     """核查失败的统一收尾：打印原因；还有重试次数就回回答员重答，
-    用完就拒答——绝不编造。"""
+    用完就拒答——绝不编造。重试时 answer_status 还没定论（不写），
+    最终定论时由 verifier 填 verified / refused。"""
     print(f"[verifier] {reason}")
     retries = state.get("retries", 0)
     if retries < MAX_RETRIES:
-        return {"final": "", "verified": False, "retry": True, "retries": retries + 1}
-    return {"final": REFUSAL, "verified": False, "retry": False,
+        return {"final": "", "retry": True, "retries": retries + 1}
+    return {"final": REFUSAL, "answer_status": "refused", "retry": False,
             "history": _append_turn_to_history(state, REFUSAL)}
 
 
@@ -319,7 +454,7 @@ def _verify_pubmed(state: State, draft: str, pubmed_results: list) -> dict:
         return _verification_failed(state, f"引用的 PMID 不在本次 PubMed 返回结果中：{bad}")
     if local_cites:
         return _verification_failed(state, "PubMed 回答里混入了本地式引用")
-    return {"final": draft, "verified": True, "retry": False,
+    return {"final": draft, "answer_status": "verified", "retry": False,
             "history": _append_turn_to_history(state, draft)}
 
 
@@ -331,13 +466,13 @@ def verifier_node(state: State):
         # PubMed 路径：只核查 PMID；回答员本来就拒答、LLM 没调通时不重试
         if draft == REFUSAL or draft.startswith("[待接 LLM]"):
             final = draft
-            return {"final": final, "verified": False, "retry": False,
+            return {"final": final, "answer_status": _refusal_status(draft), "retry": False,
                     "history": _append_turn_to_history(state, final)}
         return _verify_pubmed(state, draft, pubmed_results)
     if not state.get("chunks") or draft == REFUSAL or draft.startswith("[待接 LLM]"):
         # 没片段、回答员本来就拒答、LLM 没调通：重试也没用，直接结束
         final = REFUSAL if not state.get("chunks") else draft
-        return {"final": final, "verified": False, "retry": False,
+        return {"final": final, "answer_status": _refusal_status(final), "retry": False,
                 "history": _append_turn_to_history(state, final)}
     cited = set((m.group(1), m.group(2)) for m in CITE_RE.finditer(draft))
     real = set(
@@ -350,13 +485,14 @@ def verifier_node(state: State):
             return _verification_failed(state, "回答没有给出引用")
         bad = sorted(cited - real)
         return _verification_failed(state, f"引用不在检索结果中：{bad}")
-    return {"final": draft, "verified": True, "retry": False,
+    return {"final": draft, "answer_status": "verified", "retry": False,
             "history": _append_turn_to_history(state, draft)}
 
 
 def _route_after_verifier(state: State) -> str:
-    """核查后的走向：通过就结束；要求重试就回回答员；否则结束（拒答）。"""
-    if state.get("verified"):
+    """核查后的走向：通过（verified/partial）就结束；要求重试就回回答员；
+    否则结束（拒答/异常）。partial 这一步还不会出现（1.5 再做），先写上。"""
+    if state.get("answer_status") in ("verified", "partial"):
         return "end"
     if state.get("retry"):
         return "answerer"
@@ -400,11 +536,21 @@ def _build_graph(checkpointer=None):
     from langgraph.graph import StateGraph, END
 
     graph = StateGraph(State)
+    graph.add_node("router", router_node)
     graph.add_node("retriever", retriever_node)
     graph.add_node("pubmed", pubmed_node)
     graph.add_node("answerer", answerer_node)
     graph.add_node("verifier", verifier_node)
-    graph.set_entry_point("retriever")
+    graph.set_entry_point("router")
+    # router 之后的分流。planner / chart_read 节点还没实现（1.2 / 2.3），
+    # 这一步先把这两个分支临时直通 retriever，保证图完整可跑；
+    # 节点实现后把映射改成真正的节点名。
+    graph.add_conditional_edges("router", _route_after_router, {
+        "planner": "retriever",    # TODO(1.2): 改成 planner 节点
+        "chart_read": "retriever",  # TODO(2.3): 改成 chart_read 节点
+        "pubmed": "pubmed",
+        "retriever": "retriever",
+    })
     graph.add_conditional_edges("retriever", _route_after_retriever, {"answerer": "answerer", "pubmed": "pubmed"})
     graph.add_edge("pubmed", "answerer")
     graph.add_edge("answerer", "verifier")
@@ -445,30 +591,43 @@ def _dedupe_pubmed_citations(results: List[dict]) -> List[dict]:
 
 
 def _to_response(result: dict) -> dict:
+    # answer_status 是最终状态；verified 是兼容字段（旧调用方读它），
+    # 只有 answer_status == "verified" 时为 True，其余一律 False。
+    # answer_status 为空（还没定论就不该到这一步）时按 refused 处理。
+    answer_status = result.get("answer_status") or "refused"
+    verified = answer_status == "verified"
     pubmed_results = result.get("pubmed_results") or []
     if pubmed_results:
         return {
             "answer": result.get("final", REFUSAL),
-            "verified": result.get("verified", False),
+            "verified": verified,
+            "answer_status": answer_status,
             "citations": _dedupe_pubmed_citations(pubmed_results),
         }
     return {
         "answer": result.get("final", REFUSAL),
-        "verified": result.get("verified", False),
+        "verified": verified,
+        "answer_status": answer_status,
         "citations": _dedupe_citations(result.get("chunks", [])),
     }
 
 
 def _run_sequential(initial: dict) -> dict:
-    """LangGraph 不可用时的顺序执行兜底，流程和图里一致（含 PubMed 分支和重试循环）。"""
+    """LangGraph 不可用时的顺序执行兜底，流程和图里一致（含 Router、PubMed 分支和重试循环）。"""
     state: State = dict(initial)
-    state.update(retriever_node(state))
-    if _route_after_retriever(state) == "pubmed":
+    state.update(router_node(state))
+    dest = _route_after_router(state)
+    if dest == "pubmed":
         state.update(pubmed_node(state))
+    else:
+        # planner / chart_read / retriever 目前都临时走 retriever
+        state.update(retriever_node(state))
+        if _route_after_retriever(state) == "pubmed":
+            state.update(pubmed_node(state))
     while True:
         state.update(answerer_node(state))
         state.update(verifier_node(state))
-        if state.get("verified") or not state.get("retry"):
+        if state.get("answer_status") in ("verified", "partial") or not state.get("retry"):
             break
     return state
 
@@ -479,7 +638,8 @@ def _run_with_graph(query: str, history=None, use_pubmed: bool = True) -> dict:
     history = _normalize_history(history)
     retrieval_query = _build_retrieval_query(query, history)
     initial = {
-        "query": query, "chunks": [], "draft": "", "final": "", "verified": False,
+        "query": query, "chunks": [], "draft": "", "final": "", "answer_status": "",
+        "route": {}, "plan": {}, "subtasks": [], "tool_calls": [], "figure": {}, "error": "",
         "history": history, "retrieval_query": retrieval_query,
         "retries": 0, "retry": False,
         "pubmed_results": [], "use_pubmed": use_pubmed,
@@ -517,7 +677,8 @@ def run(query: str, history=None, thread_id=None, use_pubmed: bool = True) -> di
                     history = _normalize_history(history)
                     retrieval_query = _build_retrieval_query(query, history)
                     initial = {
-                        "query": query, "chunks": [], "draft": "", "final": "", "verified": False,
+                        "query": query, "chunks": [], "draft": "", "final": "", "answer_status": "",
+                        "route": {}, "plan": {}, "subtasks": [], "tool_calls": [], "figure": {}, "error": "",
                         "history": history, "retrieval_query": retrieval_query,
                         "retries": 0, "retry": False,
                         "pubmed_results": [], "use_pubmed": use_pubmed,

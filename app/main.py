@@ -20,7 +20,8 @@ class AskRequest(BaseModel):
 
 class AskResponse(BaseModel):
     answer: str
-    verified: bool
+    verified: bool  # 兼容字段：只有 answer_status == "verified" 时为 True
+    answer_status: str = "refused"  # 最终状态：verified / partial / refused / error
     citations: list = []
 
 @app.get("/health")
@@ -30,7 +31,9 @@ def health():
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
     result = run(req.query, history=req.history, thread_id=req.thread_id or None)
-    return AskResponse(answer=result["answer"], verified=result["verified"], citations=result["citations"])
+    return AskResponse(answer=result["answer"], verified=result["verified"],
+                       answer_status=result.get("answer_status", "refused"),
+                       citations=result["citations"])
 
 
 def _split_stream_chunks(text: str, max_chars: int = 24) -> list:
@@ -64,7 +67,7 @@ def ask_stream(req: AskRequest):
     正确的取舍。首字延迟和 /ask 一样，好处是长答案不用等整段写完才看到。
     事件格式（每行 `data: {json}`，空行分隔）：
       {"type": "token", "text": "..."}  答案的一小块
-      {"type": "done", "verified": true/false, "citations": [...]}  结束
+      {"type": "done", "verified": true/false, "answer_status": "verified", "citations": [...]}  结束
       {"type": "error", "message": "..."}  出错（run 抛异常时）
     """
     def events():
@@ -75,6 +78,6 @@ def ask_stream(req: AskRequest):
             return
         for chunk in _split_stream_chunks(result["answer"]):
             yield f"data: {json.dumps({'type': 'token', 'text': chunk}, ensure_ascii=False)}\n\n"
-        yield f"data: {json.dumps({'type': 'done', 'verified': result['verified'], 'citations': result['citations']}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'verified': result['verified'], 'answer_status': result.get('answer_status', 'refused'), 'citations': result['citations']}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream")

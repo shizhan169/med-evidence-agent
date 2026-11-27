@@ -1,0 +1,27 @@
+# 开发集：25 篇（可用来调参、调试、写开发集评测题）
+
+2022-bethlehem-brain-charts.pdf
+2023-dibiase-mapping-brain-charts.pdf
+2023-fujita-brain-volume-aging.pdf
+2024-ge-centilebrain.pdf
+2026-seidel-baseline-cortical-thickness.pdf
+2026-bayer-charting-velocity-brain-growth.pdf
+2025-kafadar-conditional-longitudinal-brain-growth.pdf
+2025-rehak-buckova-normative-models-longitudinal-changes.pdf
+2025-fraza-neurodegenerative-progression-parkinsons.pdf
+2024-gaiser-cortical-thickness-trajectories-children.pdf
+2022-poos-longitudinal-brain-atrophy-ftd.pdf
+2022-brouwer-genetic-variants-longitudinal-brain-structure.pdf
+2026-ho-unified-multi-cohort-harmonisation.pdf
+2025-cirstian-white-matter-development-autism.pdf
+2016-marquand-heterogeneity-normative-models.pdf
+2022-rutherford-brain-growth-aging-precision.pdf
+2022-rutherford-normative-modeling-framework-psychiatry.pdf
+2020-pomponio-harmonization-mri-datasets.pdf
+2018-fortin-harmonization-cortical-thickness.pdf
+2023-segal-regional-circuit-network-heterogeneity.pdf
+2022-kia-closing-lifecycle-normative-modeling.pdf
+2017-coupe-unified-analysis-brain-maturation-aging.pdf
+2021-romero-unified-analysis-cerebellum-maturation-aging.pdf
+2012-hedman-human-brain-changes-review-56-longitudinal-mri.pdf
+2008-shaw-neurodevelopmental-trajectories-cerebral-cortex.pdf

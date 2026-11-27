@@ -89,12 +89,15 @@ def test_split_chunks_lossless():
 
 
 def test_ask_unchanged(monkeypatch):
-    """POST /ask 的返回格式一点没变：还是 {answer, verified, citations}。"""
+    """POST /ask 的返回格式：{answer, verified, citations} 没变，
+    另新增 answer_status 字段（框架 v2 第一阶段 1.1：verified 改名后的
+    四种最终状态；verified 是从它派生的兼容字段）。"""
     client = _client_with_fake_llm(monkeypatch, ANSWER)
     resp = client.post("/ask", json={"query": "总白质体积在几岁达到峰值？"})
     assert resp.status_code == 200
     data = resp.json()
-    assert set(data.keys()) == {"answer", "verified", "citations"}
+    assert set(data.keys()) == {"answer", "verified", "answer_status", "citations"}
     assert data["answer"] == ANSWER
     assert data["verified"] is True
+    assert data["answer_status"] == "verified"
     assert data["citations"][0]["source"] == "2022-bethlehem-brain-charts.pdf"
