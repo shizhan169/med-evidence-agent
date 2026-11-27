@@ -16,6 +16,11 @@
 
 注意：完整评测只能在本地跑（需要 bge-m3 和 DeepSeek key），所以这不是
 GitHub Actions——GitHub 上跑不了。是本地一键 + 对比报告。
+
+新维度（2.4 扩展）：逐题对比也看路由正确性、引用状态和复杂任务完成度，
+老 results.json 没有这些字段时跳过，不误报。停表规则的“严重退步”现在也包括
+原 20 题的新维度退步（路由对变错、引用完全命中变不完全、完成度下降），
+因为路由和规划是框架的核心能力；图表题和多轮序列的退步只列出来，不单独判不通过。
 """
 import json
 import sys
@@ -60,6 +65,31 @@ def _question_change(prev: dict, new: dict):
             return "regression", f"{qid}：引用命中变未命中"
         if not prev["citation_hit"] and new["citation_hit"]:
             return "improvement", f"{qid}：引用未命中变命中"
+    # 新维度（只有两轮都有这个字段时才比；老 results.json 没有这些字段时跳过）
+    status_cn = {"full": "完全命中", "partial": "不完全命中", "miss": "未命中"}
+    comp_cn = {"complete": "完全完成", "partial": "部分完成", "incomplete": "未完成"}
+    prev_route = prev.get("route_correct")
+    new_route = new.get("route_correct")
+    if prev_route is True and new_route is False:
+        return "regression", f"{qid}：路由对变错"
+    if prev_route is False and new_route is True:
+        return "improvement", f"{qid}：路由错变对"
+    prev_status = prev.get("citation_status")
+    new_status = new.get("citation_status")
+    if prev_status and new_status and prev_status != new_status:
+        order = {"full": 2, "partial": 1, "miss": 0}
+        if order[new_status] < order[prev_status]:
+            return "regression", f"{qid}：引用从{status_cn[prev_status]}变{status_cn[new_status]}"
+        if order[new_status] > order[prev_status]:
+            return "improvement", f"{qid}：引用从{status_cn[prev_status]}变{status_cn[new_status]}"
+    prev_comp = prev.get("task_completion")
+    new_comp = new.get("task_completion")
+    if prev_comp and new_comp and prev_comp != new_comp:
+        order = {"complete": 2, "partial": 1, "incomplete": 0}
+        if order[new_comp] < order[prev_comp]:
+            return "regression", f"{qid}：复杂任务完成度从{comp_cn[prev_comp]}变{comp_cn[new_comp]}"
+        if order[new_comp] > order[prev_comp]:
+            return "improvement", f"{qid}：复杂任务完成度从{comp_cn[prev_comp]}变{comp_cn[new_comp]}"
     return None, ""
 
 
@@ -103,7 +133,7 @@ def stop_rule_verdict(new_summary: dict, regressions: list):
 
 def _summary_line(summary: dict) -> str:
     orig, fig = summary.get("original", {}), summary.get("figure", {})
-    return (
+    base = (
         f"原 20 题：可回答已答 {orig.get('answerable_answered')}/{orig.get('answerable_total')}，"
         f"引用准确率 {orig.get('citation_accuracy', 0):.1%}，"
         f"应拒答 {orig.get('should_refuse_correct')}/{orig.get('should_refuse_total')}，"
@@ -113,6 +143,22 @@ def _summary_line(summary: dict) -> str:
         f"应拒答 {fig.get('should_refuse_correct')}/{fig.get('should_refuse_total')}，"
         f"编造 {fig.get('fabrication_count')} 次"
     )
+    router = summary.get("router") or {}
+    planning = summary.get("planning") or {}
+    vlm = summary.get("vlm") or {}
+    mt = summary.get("multiturn") or {}
+    extra = []
+    if router:
+        extra.append(f"路由 {router.get('correct')}/{router.get('total')}，准确率 {router.get('accuracy', 0):.1%}")
+    if planning:
+        extra.append(f"planning 完全完成 {planning.get('complete')}/{planning.get('total')}")
+    if vlm:
+        extra.append(f"VLM 引用准确率 {vlm.get('citation_accuracy', 0):.1%}，vision 路由 {vlm.get('vision_routed')}/{vlm.get('total')}")
+    if mt:
+        extra.append(f"多轮 {mt.get('total_turns')} 轮")
+    if extra:
+        base += "；" + "；".join(extra)
+    return base
 
 
 def build_compare_markdown(prev_summary: dict, new_summary: dict, comparison: dict,
