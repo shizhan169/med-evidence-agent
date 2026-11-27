@@ -35,6 +35,10 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# 直接运行脚本时，eval/datasets 会被识别为顶层 datasets 包，
+# 使 sentence-transformers 误以为已安装 Hugging Face datasets。
+if str(ROOT / "eval") in sys.path:
+    sys.path.remove(str(ROOT / "eval"))
 sys.path.insert(0, str(ROOT))
 
 from app.agent import run  # noqa: E402
