@@ -42,12 +42,22 @@ def tracing_enabled():
     return LANGSMITH_TRACING == "true"
 
 
-# VLM 读图（第二阶段 2.3）：Qwen-VL，走 OpenAI 兼容接口（和 LLM 同一套 key）。
+# VLM 读图（第二阶段 2.3）：Qwen-VL，走 OpenAI 兼容接口。
 # 默认走 DashScope 的 qwen-vl-plus；如果 LLM_BASE_URL 是 ModelScope，
 # 把 VLM_MODEL 改成 ModelScope 上有的 VL 模型（比如 Qwen/Qwen2.5-VL-72B-Instruct）。
 # VLM_BASE_URL 默认跟 LLM_BASE_URL 走；想让 VLM 单独走另一个服务再改它。
+# VLM_API_KEY：VLM 单独的 key。不填时跟 LLM 用同一个 key（get_api_key）；
+# LLM 和 VLM 走不同服务、key 不一样时才需要填——比如 LLM 走 ModelScope、
+# VLM 走 DashScope：只填 VLM_API_KEY，不动 QWEN_API_KEY，不然 get_api_key()
+# 会优先返回 DashScope 的 key，LLM 调 ModelScope 时会被拒。
 VLM_MODEL = os.getenv("VLM_MODEL", "qwen-vl-plus")
 VLM_BASE_URL = os.getenv("VLM_BASE_URL", LLM_BASE_URL)
+VLM_API_KEY = os.getenv("VLM_API_KEY", "")
+
+
+def get_vlm_api_key():
+    """VLM 用的 key：优先 VLM_API_KEY，没填就跟 LLM 用同一个。"""
+    return VLM_API_KEY or get_api_key()
 
 # MCP PubMed 搜索（第 5 步，5a：只搜不下）。
 # 服务端是 @cyanheads/pubmed-mcp-server（npx 拉起，stdio 方式），版本钉死在

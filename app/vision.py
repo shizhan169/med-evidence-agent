@@ -18,7 +18,7 @@ import base64
 import re
 from pathlib import Path
 
-from .config import VLM_BASE_URL, VLM_MODEL, get_api_key
+from .config import VLM_BASE_URL, VLM_MODEL, get_vlm_api_key
 from .prompts import load_prompt
 
 # 图注行的开头格式（和 ingest._extract_captions、tools._FIGURE_RE 一致）：
@@ -184,10 +184,10 @@ def _chart_reader_prompt(question, caption):
 
 
 def _default_vlm_call(image_bytes, prompt_text):
-    """真实 VLM 调用：Qwen-VL，走 OpenAI 兼容接口（和 agent._call_llm
-    同一套 key/地址）。没 key 时直接报错，调用方转成 available=False，
-    不让问答断掉。"""
-    api_key = get_api_key()
+    """真实 VLM 调用：Qwen-VL，走 OpenAI 兼容接口。key 用 get_vlm_api_key()
+   （优先 VLM_API_KEY，没填就跟 LLM 用同一个）。没 key 时直接报错，
+    调用方转成 available=False，不让问答断掉。"""
+    api_key = get_vlm_api_key()
     if not api_key:
         raise RuntimeError("没有 API key，无法调用 VLM")
     from openai import OpenAI

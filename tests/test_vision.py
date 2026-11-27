@@ -233,3 +233,27 @@ def test_chart_read_tool_no_params():
     result = tools.call_tool("chart_read")
     assert result["success"] is True
     assert result["data"]["available"] is False
+
+
+# ---------- VLM 单独 key（2026-11-28：LLM 走 ModelScope、VLM 走 DashScope） ----------
+
+def test_get_vlm_api_key_prefers_vlm_key(monkeypatch):
+    # VLM_API_KEY 填了就用它，不受 QWEN_API_KEY / DEEPSEEK_API_KEY 影响。
+    # 不然直接填 QWEN_API_KEY 会让 get_api_key() 优先返回 DashScope 的 key，
+    # LLM 调 ModelScope 时会被拒。
+    from app import config
+    monkeypatch.setattr(config, "VLM_API_KEY", "vlm-key")
+    monkeypatch.setattr(config, "QWEN_API_KEY", "dashscope-key")
+    monkeypatch.setattr(config, "DEEPSEEK_API_KEY", "modelscope-key")
+    assert config.get_vlm_api_key() == "vlm-key"
+    # LLM 用的 key 不变，还是 ModelScope 那个
+    assert config.get_api_key() == "dashscope-key"
+
+
+def test_get_vlm_api_key_falls_back_to_llm_key(monkeypatch):
+    # VLM_API_KEY 没填时跟 LLM 用同一个 key（老行为不变）
+    from app import config
+    monkeypatch.setattr(config, "VLM_API_KEY", "")
+    monkeypatch.setattr(config, "QWEN_API_KEY", "")
+    monkeypatch.setattr(config, "DEEPSEEK_API_KEY", "modelscope-key")
+    assert config.get_vlm_api_key() == "modelscope-key"
