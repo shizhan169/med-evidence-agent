@@ -1,8 +1,9 @@
 """LangGraph 三角色：检索员 -> 回答员 -> 核查员。轻量版多智能体。
 框架 v2 第一阶段 1.1：入口加了 Router 节点（结构化路由），State 加了
 route / plan / subtasks / tool_calls / figure / error，verified 改名
-answer_status（四种最终状态）。planner / chart_read 节点还没实现，
-router 的那两个分支这一步先临时直通 retriever（见 _build_graph 的 TODO）。"""
+answer_status（四种最终状态）。1.2：planner / executor 节点已实现，
+router 的 planning 分支走真正的 planner；chart_read 节点还没实现，
+router 的 vision 分支这一步仍临时直通 retriever（见 _build_graph 的 TODO）。"""
 import json
 import os
 import re
@@ -10,6 +11,7 @@ from typing import TypedDict, List
 
 from .config import CHECKPOINTS_DB, LLM_BASE_URL, LLM_MODEL, PUBMED_CANDIDATE_K, PUBMED_TOP_K, get_api_key, tracing_enabled
 from .prompts import load_prompt
+from .tools import call_tool, list_tools
 
 REFUSAL = "根据现有文献无法回答。"
 
@@ -31,8 +33,9 @@ class State(TypedDict):
     # 路由（1.1）：Router 的结构化输出 {task_type, requires_planning,
     # requires_external_search, requires_vision}
     route: dict
-    # 规划（1.2 预留）：Planner 的总体计划；subtasks 是结构化子任务列表，
-    # 这一步先留空，Planner 在下一步填
+    # 规划（1.2）：Planner 的总体计划；subtasks 是结构化子任务列表，
+    # 每个子任务 {task_id, query, status, evidence_ids, result, retry_count}，
+    # status 是 pending / running / completed / failed / insufficient_evidence
     plan: dict
     subtasks: List[dict]
     # 工具调用记录（1.3）：[{tool, params, result, success, error}]
@@ -190,7 +193,7 @@ def router_node(state: State):
 def _route_after_router(state: State) -> str:
     """router 之后的分流，优先级：planning → vision → 外部搜索 → 本地检索。
     返回的是逻辑目的地（"planner"/"chart_read"/"pubmed"/"retriever"），
-    图里的映射把还没实现的节点临时直通 retriever（见 _build_graph 的 TODO）。
+    图里的映射把还没实现的 chart_read 节点临时直通 retriever（见 _build_graph 的 TODO）。
     use_pubmed=False（评测）时不走 PubMed——评测的 28 道题测本地 RAG，
     外部搜索开关关了，路由也不触发。"""
     route = state.get("route") or {}
@@ -312,6 +315,209 @@ def _route_after_retriever(state: State) -> str:
     if state.get("chunks") and not _asks_new_literature(state.get("query", "")):
         return "answerer"
     return "pubmed"
+
+
+# Planner / Executor（框架 v2，第一阶段 1.2）。
+# Planner 只负责拆解，不执行、不选工具；Executor 只在单个子任务内做
+# 有限自主选工具（不是全量 ReAct：Planner 先定子任务结构）。
+PLANNER_PROMPT = load_prompt("planner", "v1")
+EXECUTOR_PROMPT = load_prompt("executor", "v1")
+
+# Executor：总共最多 MAX_EXECUTOR_STEPS 次工具调用，超了就停，返回部分结果；
+# 每个子任务最多重试 MAX_SUBTASK_RETRIES 次（失败只重跑失败的子任务）。
+MAX_EXECUTOR_STEPS = 8
+MAX_SUBTASK_RETRIES = 1
+
+
+def _parse_plan(raw: str) -> tuple:
+    """解析 Planner 的 JSON 输出，返回 (goal, 子任务 query 列表)。
+    解析失败、结构不对、子任务为空，都返回 ("", [])——调用方退回单个子任务。
+    子任务最多取 5 个。"""
+    if not raw:
+        return "", []
+    try:
+        m = re.search(r"\{.*\}", raw, re.S)
+        data = json.loads(m.group(0)) if m else {}
+    except Exception:
+        return "", []
+    if not isinstance(data, dict):
+        return "", []
+    goal = data.get("goal") if isinstance(data.get("goal"), str) else ""
+    subtasks = data.get("subtasks")
+    if not isinstance(subtasks, list):
+        return goal.strip(), []
+    queries = []
+    for s in subtasks:
+        if isinstance(s, dict) and isinstance(s.get("query"), str) and s["query"].strip():
+            queries.append(s["query"].strip())
+    return goal.strip(), queries[:5]
+
+
+def planner_node(state: State):
+    """Planner 节点：把复杂问题拆解成结构化子任务，写进 State["subtasks"]。
+    触发条件是“需要拆解”，不是“跨文献”——单篇内需要多步推理的复杂问题
+    也可以拆（Router 的 requires_planning 为真就进这里，不再判断是不是跨文献）。
+    拆解失败（LLM 没调通、返回的不是合法 JSON、子任务为空）时退回单个子任务
+    （就是原问题本身），问答不断。"""
+    query = state.get("query", "")
+    goal, queries = "", []
+    try:
+        raw = _call_llm(PLANNER_PROMPT.format(query=query))
+        goal, queries = _parse_plan(raw)
+    except Exception as e:
+        print(f"[planner] 拆解失败（{e}），退回单个子任务")
+    if not queries:
+        goal, queries = query, [query]
+    subtasks = [
+        {"task_id": f"S{i + 1}", "query": q, "status": "pending",
+         "evidence_ids": [], "result": "", "retry_count": 0}
+        for i, q in enumerate(queries)
+    ]
+    print(f"[planner] {query} → {len(subtasks)} 个子任务")
+    return {"plan": {"goal": goal, "total": len(subtasks)}, "subtasks": subtasks}
+
+
+def _build_executor_prompt(subtask_query: str) -> str:
+    """给 Executor 选工具用的 prompt：工具列表（名字 + 描述）+ 子任务。"""
+    tools_text = "\n".join(
+        f"- {t['name']}：{t['description']}" for t in list_tools()
+    )
+    return EXECUTOR_PROMPT.format(tools=tools_text, subtask=subtask_query)
+
+
+def _parse_tool_call(raw: str) -> tuple:
+    """解析 Executor 的选工具 JSON，返回 (工具名, 参数 dict)。
+    解析失败、工具名不在注册表里、参数不是 dict，都退回
+    ("local_search", {})——本地检索是默认工具，选不出来也不断问答；
+    调用方会把子任务的 query 补进 local_search 的参数。"""
+    if not raw:
+        return "local_search", {}
+    try:
+        m = re.search(r"\{.*\}", raw, re.S)
+        data = json.loads(m.group(0)) if m else {}
+    except Exception:
+        return "local_search", {}
+    if not isinstance(data, dict):
+        return "local_search", {}
+    tool = data.get("tool")
+    params = data.get("params")
+    if not isinstance(tool, str) or tool not in {t["name"] for t in list_tools()}:
+        return "local_search", {}
+    if not isinstance(params, dict):
+        params = {}
+    return tool, params
+
+
+def _merge_chunks(existing: list, new: list) -> list:
+    """把新检索到的片段并进已有片段，按 (source, page, text) 去重。"""
+    seen = {(str(c.get("source")), str(c.get("page")), str(c.get("text"))) for c in existing}
+    out = list(existing)
+    for c in new:
+        key = (str(c.get("source")), str(c.get("page")), str(c.get("text")))
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
+
+
+def _merge_pubmed_results(existing: list, new: list) -> list:
+    """把新的 PubMed 文章并进已有结果，按 PMID 去重。"""
+    seen = {str(r.get("pmid", "")) for r in existing}
+    out = list(existing)
+    for r in new:
+        pmid = str(r.get("pmid", ""))
+        if pmid and pmid not in seen:
+            seen.add(pmid)
+            out.append(r)
+    return out
+
+
+def executor_node(state: State):
+    """Executor 节点：按子任务顺序执行。
+    每个子任务：LLM 按子任务 + 工具描述选工具 → 校验参数并执行 →
+    结果写回 State（子任务的 result、evidence_ids、status）。
+    有限循环：总共最多 MAX_EXECUTOR_STEPS 次工具调用，超了就停，
+    剩下的子任务保持 pending，返回已有的部分结果。
+    失败只重跑失败的子任务（每个子任务最多重试 MAX_SUBTASK_RETRIES 次，
+    重试时重新选工具），不重跑全流程。
+    chart_read 是占位（available=False），选到它时子任务记为
+    insufficient_evidence，不重试。每个工具调用都记进 tool_calls。"""
+    subtasks = [dict(s) for s in state.get("subtasks") or []]
+    tool_calls = list(state.get("tool_calls") or [])
+    chunks = list(state.get("chunks") or [])
+    pubmed_results = list(state.get("pubmed_results") or [])
+    steps = 0
+    for st in subtasks:
+        if steps >= MAX_EXECUTOR_STEPS:
+            break
+        if st.get("status") != "pending":
+            continue
+        st["status"] = "running"
+        while steps < MAX_EXECUTOR_STEPS:
+            # 选工具：LLM 按子任务 + 工具描述选；选不出来用默认 local_search
+            try:
+                raw = _call_llm(_build_executor_prompt(st.get("query", "")))
+            except Exception as e:
+                print(f"[executor] 选工具失败（{e}），用默认 local_search")
+                raw = ""
+            tool_name, params = _parse_tool_call(raw)
+            if tool_name in ("local_search", "pubmed_search") and not params.get("query"):
+                params["query"] = st.get("query", "")
+            result = call_tool(tool_name, **params)
+            steps += 1
+            tool_calls.append({
+                "tool": tool_name, "params": params,
+                "result": result.get("data"), "success": result.get("success", False),
+                "error": result.get("error"),
+            })
+            # chart_read 占位：工具本身“成功”但返回 available=False，
+            # 说明现在读不了图——子任务记 insufficient_evidence，不重试
+            if (tool_name == "chart_read" and isinstance(result.get("data"), dict)
+                    and result["data"].get("available") is False):
+                st["status"] = "insufficient_evidence"
+                st["result"] = result["data"].get("reason", "VLM 未实现")
+                break
+            if result.get("success"):
+                data = result.get("data") or {}
+                if tool_name == "local_search":
+                    new_chunks = data.get("chunks") or []
+                    chunks = _merge_chunks(chunks, new_chunks)
+                    st["evidence_ids"] = [f"{c.get('source', '未知')} p.{c.get('page', '?')}" for c in new_chunks]
+                    st["result"] = f"检索到 {len(new_chunks)} 个片段"
+                    st["status"] = "completed"
+                elif tool_name == "pubmed_search":
+                    new_results = data.get("results") or []
+                    pubmed_results = _merge_pubmed_results(pubmed_results, new_results)
+                    st["evidence_ids"] = [str(r.get("pmid", "")) for r in new_results]
+                    st["result"] = f"检索到 {len(new_results)} 篇文献"
+                    st["status"] = "completed"
+                elif tool_name == "chart_locate":
+                    if data.get("found"):
+                        st["evidence_ids"] = [str(data.get("source", ""))]
+                        st["result"] = data.get("caption", "")
+                        st["status"] = "completed"
+                    else:
+                        st["evidence_ids"] = []
+                        st["result"] = "未找到该图表"
+                        st["status"] = "insufficient_evidence"
+                else:
+                    st["result"] = str(data)
+                    st["status"] = "completed"
+                break
+            # 工具执行失败：还有重试次数就重新选工具再试一次（只重跑这个子任务），
+            # 用完就记 failed
+            if st.get("retry_count", 0) < MAX_SUBTASK_RETRIES:
+                st["retry_count"] = st.get("retry_count", 0) + 1
+                print(f"[executor] 子任务 {st.get('task_id')} 失败，重试 {st['retry_count']}/{MAX_SUBTASK_RETRIES}")
+                continue
+            st["status"] = "failed"
+            st["result"] = result.get("error") or "工具执行失败"
+            break
+    # 步骤上限打断时，正在跑的子任务改回 pending（它没执行完，不是失败）
+    for st in subtasks:
+        if st.get("status") == "running":
+            st["status"] = "pending"
+    return {"subtasks": subtasks, "tool_calls": tool_calls, "chunks": chunks, "pubmed_results": pubmed_results}
 
 
 def _normalize_history(history) -> List[dict]:
@@ -541,20 +747,26 @@ def _build_graph(checkpointer=None):
 
     graph = StateGraph(State)
     graph.add_node("router", router_node)
+    graph.add_node("planner", planner_node)
+    graph.add_node("executor", executor_node)
     graph.add_node("retriever", retriever_node)
     graph.add_node("pubmed", pubmed_node)
     graph.add_node("answerer", answerer_node)
     graph.add_node("verifier", verifier_node)
     graph.set_entry_point("router")
-    # router 之后的分流。planner / chart_read 节点还没实现（1.2 / 2.3），
-    # 这一步先把这两个分支临时直通 retriever，保证图完整可跑；
+    # router 之后的分流。chart_read 节点还没实现（2.3），
+    # 这一步先把这个分支临时直通 retriever，保证图完整可跑；
     # 节点实现后把映射改成真正的节点名。
     graph.add_conditional_edges("router", _route_after_router, {
-        "planner": "retriever",    # TODO(1.2): 改成 planner 节点
+        "planner": "planner",
         "chart_read": "retriever",  # TODO(2.3): 改成 chart_read 节点
         "pubmed": "pubmed",
         "retriever": "retriever",
     })
+    graph.add_edge("planner", "executor")
+    # executor 执行完，证据已汇总进 chunks / pubmed_results，直接去回答员；
+    # 不再经过 retriever（证据已经由子任务的工具调用拿到，不用再查一遍）。
+    graph.add_edge("executor", "answerer")
     graph.add_conditional_edges("retriever", _route_after_retriever, {"answerer": "answerer", "pubmed": "pubmed"})
     graph.add_edge("pubmed", "answerer")
     graph.add_edge("answerer", "verifier")
@@ -621,10 +833,13 @@ def _run_sequential(initial: dict) -> dict:
     state: State = dict(initial)
     state.update(router_node(state))
     dest = _route_after_router(state)
-    if dest == "pubmed":
+    if dest == "planner":
+        state.update(planner_node(state))
+        state.update(executor_node(state))
+    elif dest == "pubmed":
         state.update(pubmed_node(state))
     else:
-        # planner / chart_read / retriever 目前都临时走 retriever
+        # chart_read / retriever 目前都临时走 retriever
         state.update(retriever_node(state))
         if _route_after_retriever(state) == "pubmed":
             state.update(pubmed_node(state))

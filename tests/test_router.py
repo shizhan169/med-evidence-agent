@@ -183,13 +183,22 @@ def test_run_error_status_when_llm_unavailable(monkeypatch):
     assert result["answer"].startswith("[待接 LLM]")
 
 
-def test_planning_branch_temporarily_falls_through_to_retriever(monkeypatch):
-    # 1.2 之前：requires_planning 的问题暂时走 retriever，不报错、能出答案。
-    # 这是临时行为，1.2 接入 Planner 后要改成真正走 planner 节点。
-    calls = {"n": 0}
+def test_planning_branch_goes_through_planner(monkeypatch):
+    # 1.2 之后：requires_planning 的问题走 planner → executor → answerer，
+    # 不再临时直通 retriever。假 LLM 按 prompt 内容分发：规划器拆解、
+    # 执行器选工具、回答员给答案各调一次。
+    calls = {"n": 0, "planner": 0, "executor": 0}
 
     def fake_llm(prompt):
         calls["n"] += 1
+        if "拆解" in prompt:
+            calls["planner"] += 1
+            return ('{"goal": "比较五篇论文的数据集", "subtasks": ['
+                    '{"query": "五篇纵向常模论文的数据集各是什么"}, '
+                    '{"query": "五篇纵向常模论文的建模变量有什么不同"}]}')
+        if "选一个最合适的工具" in prompt:
+            calls["executor"] += 1
+            return '{"tool": "local_search", "params": {"query": "五篇纵向常模论文的数据集"}}'
         return ANSWER
 
     monkeypatch.setattr("app.rag.retrieve", lambda query, top_k=10, llm_call=None: CHUNKS)
@@ -197,4 +206,6 @@ def test_planning_branch_temporarily_falls_through_to_retriever(monkeypatch):
     result = agent.run("比较五篇纵向常模论文的数据集有什么不同")
     assert result["answer_status"] == "verified"
     assert result["verified"] is True
-    assert calls["n"] == 1  # 只有回答员调了一次 LLM，Router 是规则分类、没调
+    assert calls["planner"] == 1  # Planner 调了一次 LLM 做拆解
+    assert calls["executor"] == 2  # 两个子任务，各选一次工具
+    assert calls["n"] == 4  # planner 1 + executor 2 + 回答员 1，Router 是规则分类、没调
