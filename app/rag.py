@@ -1,12 +1,17 @@
 """检索 + 引用格式化。核心规则：没有依据就拒答，引用必须带页码。
 
-检索是混合式：向量检索（多语言 embedding）+ 关键词检索（BM25），各占一半名额。
+检索是混合式：向量检索（多语言 embedding）+ 关键词检索（BM25），
+再按 RRF（Reciprocal Rank Fusion）按排名融合，不是固定名额拼接。
 原因：问题是中文，文献是英文，跨语言向量检索常漏掉含论文名 / 术语 / 数字的
 关键片段；BM25 能直接命中这些与语言无关的 token（Bethlehem、MFPR、
 CentileBrain、123,984 等）。BM25 是标准算法（词频 + 逆文档频率加权），
 索引只建一次并缓存，库扩到 1000 篇也能用；不要用“数 token 个数 + 文件名
 加权”这种临时补丁代替它（2026-11-25 复盘：临时补丁每次查询全库扫一遍、
 依赖我方的文件名格式、通用 token 一多就同分，扩展性差）。
+固定名额拼接（向量 5 + BM25 5）的问题是两路质量不一样时，差的一路也占
+一半名额；RRF 按排名加权，两路都靠前的片段分最高，只在一路靠前的也能进，
+但分低。RRF 是融合方式，不是重排模型，和 bge-reranker 是两回事；
+重排器保持关闭（2026-11-25 已验证重排会误杀正确片段，Q05、Q11）。
 """
 import re
 
@@ -30,6 +35,14 @@ COLLECTION = "medevidence"
 # 向量 5 + BM25 5，不重排，检索不断。
 RERANK_POOL_PER_SIDE = 15
 RERANK_TOP_K = 5
+
+# RRF 融合：score = 1/(k + rank)，rank 从 1 开始；k=60 是 RRF 论文的默认值。
+RRF_K = 60
+# 每路先取的候选池：RRF 融合需要比 top_k 大的池子才有意义，取 15+15。
+RRF_POOL_PER_SIDE = 15
+# 上下文组装：返回给回答员的片段总长度预算（字符数），约 10 个片段；
+# 超了按相关性顺序截断，排在前面的优先保留。
+MAX_CONTEXT_CHARS = 12000
 
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]*|\d+(?:\.\d+)?")
 _STOPWORDS = {
@@ -73,6 +86,94 @@ def _query_tokens(query: str) -> list:
     for m in re.finditer(r"(?:表|Table)\s*(\d+)", query or "", re.IGNORECASE):
         tokens.add(f"table{m.group(1)}")
     return sorted(tokens)
+
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+# 追问的指代词（和 agent.py 的 FOLLOWUP_MARKERS 一致，那边也用同一组词判断追问）
+_FOLLOWUP_MARKERS = ("那", "它", "这个", "那个", "呢")
+# 判断一段文本像不像问题：用来校验 LLM 改写/翻译的结果——测试里的假 LLM
+# 会对任何 prompt 返回同一段答案文本，不能把它当成改写结果用。
+_QUESTION_HINTS = ("？", "?", "吗", "呢", "什么", "几", "多少", "如何", "是否",
+                    "是不是", "哪个", "哪些", "为什么", "怎样", "怎么")
+
+
+def _has_chinese(text: str) -> bool:
+    return bool(_CJK_RE.search(text or ""))
+
+
+def _looks_like_question(text: str) -> bool:
+    """改写结果像不像一个问题：非空、不太长、带疑问标记、不含引用标记。
+    假 LLM 返回的答案（陈述句、带 [来源：...]）会被拦下来，退回拼上文。"""
+    t = (text or "").strip()
+    if not t or len(t) > 300:
+        return False
+    if "[来源" in t or "来源：" in t:
+        return False
+    return any(h in t for h in _QUESTION_HINTS)
+
+
+def rewrite_query_for_retrieval(query: str, history: list = None, llm_call=None) -> str:
+    """多轮追问改写：把带指代词的追问改写成完整独立的问题（指代消解、省略补全），
+    改写后的问题才拿去检索。不是追问、没历史时原样返回，不加东西。
+    先调 LLM 改写（用历史里的具体实体替换“它/那/这个/那个”，补全省略的部分）；
+    改写失败、改出来不像问题（空串、陈述句、带引用的答案）时，退回老做法——
+    把上一轮用户问题拼在前面，检索能看到完整意思。llm_call 是调用方传进来的
+    LLM（agent.py 传 _call_llm）；不传时只用拼上文的退回做法，不调 LLM。"""
+    q = (query or "").strip()
+    if not q or not history:
+        return q
+    if not any(m in q for m in _FOLLOWUP_MARKERS):
+        return q
+    prev = None
+    for msg in reversed(history):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = (msg.get("content") or "").strip()
+            if content:
+                prev = content
+                break
+    if not prev:
+        return q
+    if llm_call is not None:
+        try:
+            rewritten = llm_call(
+                "根据对话历史，把下面的追问改写成一个完整、独立的问题："
+                "用历史里提到的具体实体替换追问中的指代词（它/那/这个/那个），"
+                "补全省略的部分。只输出改写后的问题，不要解释。\n"
+                f"上一轮问题：{prev}\n追问：{q}"
+            )
+        except Exception as e:
+            print(f"[rewrite] 改写失败（{e}），退回拼上文")
+            rewritten = ""
+        rewritten = (rewritten or "").strip()
+        if _looks_like_question(rewritten):
+            return rewritten
+    return f"{prev} {q}"
+
+
+def translate_query_to_english(query: str, llm_call=None) -> str:
+    """中文问题翻英文检索词：跨语言向量检索弱（Q09 的教训：中文问题对英文论文
+    召回差），中文问题先翻成英文再查本地库。只翻中文问题，纯英文原样返回；
+    不传 llm_call 时不翻译；翻译失败、翻出来还是中文、翻出来太长，
+    都原样返回——检索不断。注意这只是给向量检索用的英文问题，BM25 仍用
+    原问题的 token（论文名、数字、图号都在原问题里）；PubMed 路径的 OR
+    拓宽也不走这里（_to_pubmed_query 仍拿中文原问题做，见 agent.py）。"""
+    q = (query or "").strip()
+    if not q or not _has_chinese(q):
+        return q
+    if llm_call is None:
+        return q
+    try:
+        translated = llm_call(
+            "把下面的中文问题翻译成英文问题，只输出英文问题，不要解释：\n" + q
+        )
+    except Exception as e:
+        print(f"[translate] 翻译失败（{e}），用原问题检索")
+        return q
+    translated = (translated or "").strip()
+    if not translated or _has_chinese(translated) or len(translated) > 500:
+        return q
+    print(f"[translate] 查询翻译：{q} → {translated}")
+    return translated
 
 
 def _get_bm25_index(collection):
@@ -136,7 +237,9 @@ def _keyword_chunks(collection, tokens: list, limit: int = 5, exclude_ids=None) 
             c = chunks[i]
             if c["id"] in exclude_ids:
                 continue
-            out.append({"text": _strip_context(c["text"]), "source": c["source"], "page": c["page"]})
+            # 带上 id：retrieve() 做 RRF 融合时按 id 去重（同一片段在向量和
+            # BM25 两路都出现时分数相加）；最终返回前再去掉 id，对外格式不变。
+            out.append({"id": c["id"], "text": _strip_context(c["text"]), "source": c["source"], "page": c["page"]})
             if len(out) >= limit:
                 break
         return out
@@ -155,11 +258,11 @@ def _keyword_chunks(collection, tokens: list, limit: int = 5, exclude_ids=None) 
         text = (doc or "").lower()
         hits = sum(1 for t in tokens if t in text)
         if hits:
-            scored.append((hits, doc, meta))
+            scored.append((hits, doc, meta, cid))
     scored.sort(key=lambda x: -x[0])
     return [
-        {"text": _strip_context(doc), "source": meta.get("source", "未知"), "page": meta.get("page", "?")}
-        for _, doc, meta in scored[:limit]
+        {"id": cid, "text": _strip_context(doc), "source": meta.get("source", "未知"), "page": meta.get("page", "?")}
+        for _, doc, meta, cid in scored[:limit]
     ]
 
 _embedding_fn = None
@@ -297,47 +400,110 @@ def format_citation(chunk: dict) -> str:
     return f"[来源：{chunk.get('source', '未知')} p.{chunk.get('page', '?')}]"
 
 
-def retrieve(query: str, top_k: int = 10):
-    """混合检索：向量和关键词各占一半名额，保证关键词的片段
-    一定能进最终结果。库为空返回 []，走拒答分支；不要编造片段。
+def _vector_chunks(collection, query: str, limit: int) -> list:
+    """向量检索：按问题向量取前 limit 个片段。失败返回 []，检索不断。
+    返回的片段带 "id"（RRF 融合按 id 去重），最终返回前再去掉。"""
+    try:
+        res = collection.query(query_texts=[query], n_results=limit)
+        docs = (res.get("documents") or [[]])[0]
+        metas = (res.get("metadatas") or [[]])[0]
+        ids = (res.get("ids") or [[]])[0]
+        return [
+            {"id": cid, "text": _strip_context(doc),
+             "source": meta.get("source", "未知"), "page": meta.get("page", "?")}
+            for doc, meta, cid in zip(docs, metas, ids)
+        ]
+    except Exception as e:
+        print(f"[retrieve] 查询失败：{e}")
+        return []
 
-    注意：不要先拿满 top_k 个向量结果再往后追加关键词——追加的部分会被
-    [:top_k] 截掉，关键词兜底等于没跑（2026-11-25 第二轮评测踩过这个坑）。
 
-    有重排模型时：候选池放宽到向量 15 + BM25 15（共 30 个），重排后取
-    前 RERANK_TOP_K（5）个给回答员；没有重排模型时保持旧行为
-    （向量 5 + BM25 5，不重排）。"""
+def _rrf_fuse(ranked_lists: list, k: int = RRF_K, top_k: int = 10) -> list:
+    """RRF 融合：多路按排名融合，score = 1/(k + rank)，rank 从 1 开始；
+    同一片段在多路都出现时分数相加。按分从高到低取前 top_k 个。
+    输入是每路排好序的片段列表（每个片段带 "id"）；输出去重后的片段
+    （保留 "id"，调用方按需去掉）。并列时先按各路最好排名、再按首次
+    出现顺序，保证结果确定。"""
+    scores = {}
+    best_rank = {}
+    first_seen = {}
+    chunks_by_id = {}
+    order = 0
+    for lst in ranked_lists:
+        for rank, c in enumerate(lst, start=1):
+            cid = c.get("id")
+            if cid is None:
+                continue
+            if cid not in chunks_by_id:
+                chunks_by_id[cid] = c
+                first_seen[cid] = order
+                order += 1
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+            best_rank[cid] = min(best_rank.get(cid, rank), rank)
+    ranked = sorted(scores, key=lambda cid: (-scores[cid], best_rank[cid], first_seen[cid]))
+    return [chunks_by_id[cid] for cid in ranked[:top_k]]
+
+
+def _assemble_context(chunks: list, max_chars: int = MAX_CONTEXT_CHARS) -> list:
+    """上下文组装：去重 + 长度预算。
+    去重：同一 (source, page, text) 只留第一次出现的（RRF 已按 id 去重，
+    这里防的是不同 id 但内容相同的片段）。
+    预算：总长度超了就按相关性顺序截断，排在前面的优先保留；第一个片段
+    再长也保留（不能返回空）。
+    相邻证据补充还没做（2.1 明确可选）：要做时按 chunk_start 找相邻片段。"""
+    seen = set()
+    out = []
+    total = 0
+    for c in chunks:
+        key = (c.get("source"), c.get("page"), c.get("text"))
+        if key in seen:
+            continue
+        seen.add(key)
+        n = len(c.get("text") or "")
+        if out and total + n > max_chars:
+            break
+        out.append(c)
+        total += n
+    return out
+
+
+def _drop_ids(chunks: list) -> list:
+    """去掉 RRF 融合用的内部 "id"，对外返回格式和原来一样
+    （只有 text / source / page）。"""
+    return [{k: v for k, v in c.items() if k != "id"} for c in chunks]
+
+
+def retrieve(query: str, top_k: int = 10, llm_call=None):
+    """混合检索：Query 改写（调用方在 _build_retrieval_query 里做）→
+    向量 + BM25 各取一个候选池 → RRF 融合 → (重排) → 组装去重 → 返回。
+
+    向量用英文检索词：中文问题先翻成英文再查（跨语言向量检索弱，Q09 的
+    教训）；BM25 用原问题的 token（论文名、数字、图号都在原问题里）。
+    翻译失败时用原问题查向量，不抛异常。llm_call 是调用方传进来的 LLM
+    （retriever_node 传 _call_llm）；不传时不翻译，只用原问题检索。
+    库为空返回 []，走拒答分支；不要编造片段。
+
+    重排器保持关闭：_get_reranker() 返回 None 时不重排（生产现状，
+    RERANKER_MODEL 指向不存在的路径）；万一哪天模型可用了，仍按老路
+    对 RRF 融合后的池子重排取前 5。"""
     try:
         collection = get_collection()
     except Exception as e:
         print(f"[retrieve] Chroma 不可用：{e}")
         return []
-    use_rerank = _get_reranker() is not None
-    if use_rerank:
-        vector_k = keyword_k = RERANK_POOL_PER_SIDE
-    else:
-        vector_k = top_k // 2
-        keyword_k = top_k - vector_k
-    chunks = []
-    seen_ids = set()
-    try:
-        res = collection.query(query_texts=[query], n_results=vector_k)
-        docs = (res.get("documents") or [[]])[0]
-        metas = (res.get("metadatas") or [[]])[0]
-        ids = (res.get("ids") or [[]])[0]
-        for doc, meta, cid in zip(docs, metas, ids):
-            seen_ids.add(cid)
-            chunks.append(
-                {"text": _strip_context(doc), "source": meta.get("source", "未知"), "page": meta.get("page", "?")}
-            )
-    except Exception as e:
-        print(f"[retrieve] 查询失败：{e}")
-    # 关键词兜底：补向量漏掉的含论文名 / 术语 / 数字的片段，有固定名额
+    # 向量检索用英文：中文问题先翻英文（跨语言向量检索弱）
+    vector_query = translate_query_to_english(query, llm_call=llm_call)
+    # 每路先取一个候选池（15+15），RRF 融合后再取 top_k；
+    # 两路独立排名（BM25 不再跳过向量已召回的），同一片段在两路都出现时 RRF 分数相加。
+    vector_chunks = _vector_chunks(collection, vector_query, limit=RRF_POOL_PER_SIDE)
     tokens = _query_tokens(query)
-    chunks.extend(_keyword_chunks(collection, tokens, limit=keyword_k, exclude_ids=seen_ids))
+    keyword_chunks = _keyword_chunks(collection, tokens, limit=RRF_POOL_PER_SIDE)
+    use_rerank = _get_reranker() is not None
+    fuse_k = RERANK_POOL_PER_SIDE if use_rerank else top_k
+    fused = _rrf_fuse([vector_chunks, keyword_chunks], top_k=fuse_k)
     if use_rerank:
-        return _rerank(query, chunks)
-    return chunks[:top_k]
+        return _drop_ids(_assemble_context(_rerank(query, fused)))
+    return _drop_ids(_assemble_context(fused))
 
 
 def build_prompt(query: str, chunks: list, history: list = None) -> str:

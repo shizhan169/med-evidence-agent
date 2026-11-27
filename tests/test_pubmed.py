@@ -108,7 +108,7 @@ def _run_with_mocks(monkeypatch, query, chunks, pubmed_results, drafts,
         llm["answer"] += 1
         return drafts[min(llm["answer"] - 1, len(drafts) - 1)]
 
-    monkeypatch.setattr("app.rag.retrieve", lambda q, top_k=10: list(chunks))
+    monkeypatch.setattr("app.rag.retrieve", lambda q, top_k=10, llm_call=None: list(chunks))
     monkeypatch.setattr("app.mcp_tools.search_pubmed", fake_search)
     monkeypatch.setattr("app.agent._call_llm", fake_llm)
     return agent.run(query, use_pubmed=use_pubmed), search_calls, llm

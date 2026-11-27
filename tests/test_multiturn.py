@@ -96,7 +96,7 @@ def test_run_passes_history_and_rewrites_retrieval(monkeypatch):
     """端到端（假 LLM + 假检索）：追问要带着上文去检索，prompt 里要有历史。"""
     seen = {}
 
-    def fake_retrieve(query, top_k=10):
+    def fake_retrieve(query, top_k=10, llm_call=None):
         seen["retrieval_query"] = query
         return [{"text": "总白质体积在 28.7 岁达到峰值。",
                  "source": "2022-bethlehem-brain-charts.pdf", "page": 3}]
@@ -125,7 +125,7 @@ def test_run_without_history_unchanged(monkeypatch):
     """不传历史时，和原来单轮行为一致：检索用原问题，prompt 里没历史。"""
     seen = {}
 
-    def fake_retrieve(query, top_k=10):
+    def fake_retrieve(query, top_k=10, llm_call=None):
         seen["retrieval_query"] = query
         return [{"text": "总白质体积在 28.7 岁达到峰值。",
                  "source": "2022-bethlehem-brain-charts.pdf", "page": 3}]

@@ -32,7 +32,7 @@ def test_run_works_with_tracing_vars_set(monkeypatch):
     monkeypatch.setenv("LANGSMITH_PROJECT", "test")
     # config 的模块级变量是 import 时读的，测试里直接改它
     monkeypatch.setattr("app.config.LANGSMITH_TRACING", "true")
-    monkeypatch.setattr("app.rag.retrieve", lambda query, top_k=10: CHUNKS)
+    monkeypatch.setattr("app.rag.retrieve", lambda query, top_k=10, llm_call=None: CHUNKS)
     monkeypatch.setattr("app.agent._call_llm", lambda prompt: ANSWER)
     result = agent.run("总白质体积在几岁达到峰值？")
     assert result["answer"] == ANSWER
