@@ -3,13 +3,18 @@
 route / plan / subtasks / tool_calls / figure / error，verified 改名
 answer_status（四种最终状态）。1.2：planner / executor 节点已实现，
 router 的 planning 分支走真正的 planner；chart_read 节点还没实现，
-router 的 vision 分支这一步仍临时直通 retriever（见 _build_graph 的 TODO）。"""
+router 的 vision 分支这一步仍临时直通 retriever（见 _build_graph 的 TODO）。
+1.4：历史管理抽到 app/memory.py；历史超限时被截掉的轮次先摘要进
+State["history_summary"] 再丢，prompt 只拼最近 2 轮完整内容 + 摘要；
+checkpointer 里仍是最近 6 轮完整历史，压缩不影响持久化。"""
 import json
 import os
 import re
 from typing import TypedDict, List
 
 from .config import CHECKPOINTS_DB, LLM_BASE_URL, LLM_MODEL, PUBMED_CANDIDATE_K, PUBMED_TOP_K, get_api_key, tracing_enabled
+from .memory import MAX_HISTORY_CHARS, MAX_HISTORY_TURNS
+from . import memory
 from .prompts import load_prompt
 from .tools import call_tool, list_tools
 
@@ -46,8 +51,11 @@ class State(TypedDict):
     # 系统异常信息（answer_status=error 时填）
     error: str
     # 多轮对话：history 是最近几轮 [{"role": "user"/"assistant", "content": ...}]，
-    # retrieval_query 是真正拿去检索的问题（追问会被拼上上文，见 _build_retrieval_query）
+    # retrieval_query 是真正拿去检索的问题（追问会被拼上上文，见 _build_retrieval_query）；
+    # history_summary 是较早轮次的压缩摘要（1.4）：历史超限时，被截掉的轮次先摘要
+    # 再丢，摘要写在这里，不丢信息；prompt 只拼最近 2 轮完整内容 + 摘要。
     history: List[dict]
+    history_summary: str
     retrieval_query: str
     # 核查重试：retries 是已重试次数，retry 是核查员要求再答一次的标志
     retries: int
@@ -63,10 +71,12 @@ class State(TypedDict):
 PMID_RE = re.compile(r"PubMed\s*PMID[:：]?\s*(\d+)")
 
 
-# 多轮对话：历史保留最近 6 轮（一轮 = 一问一答），总字数不超过 4000 字，
+# 多轮对话的历史上限（定义在 app/memory.py，这里 import 进来，旧测试读
+# agent.MAX_HISTORY_TURNS / MAX_HISTORY_CHARS 不受影响）。
+# 历史保留最近 6 轮（一轮 = 一问一答），总字数不超过 4000 字，
 # 太长就从最早的一轮开始丢；prompt 太长既费 token、模型也容易抓不住重点。
-MAX_HISTORY_TURNS = 6
-MAX_HISTORY_CHARS = 4000
+# 1.4 之后：被截掉的轮次先摘要进 history_summary 再丢（见 _append_turn_to_history），
+# 摘要写进 State，不丢信息；压缩只影响传给 LLM 的 prompt 上下文。
 
 # 追问标志词：问题里有这些词、又有历史时，说明它在指代上文（比如“那白质呢？”），
 # 检索时要带上上一轮的问题，否则光凭“那白质呢”几个字检索不到白质体积的片段。
@@ -522,27 +532,13 @@ def executor_node(state: State):
 
 def _normalize_history(history) -> List[dict]:
     """把调用方传来的 history 洗成干净的 [{"role", "content"}] 列表。
-    只要 user/assistant 两种角色，空内容丢掉；只保留最近 MAX_HISTORY_TURNS 轮；
-    再按总字数截断，超了就从最早的一轮开始丢。返回的一定是整轮。"""
-    if not history:
-        return []
-    cleaned = []
-    for msg in history:
-        if not isinstance(msg, dict):
-            continue
-        role = msg.get("role")
-        content = (msg.get("content") or "").strip()
-        if role not in ("user", "assistant") or not content:
-            continue
-        cleaned.append({"role": role, "content": content})
-    # 只留最近 N 轮；开头如果是 assistant（上一轮的回答没配上问题），丢掉它，保证整轮
-    keep = cleaned[-MAX_HISTORY_TURNS * 2:]
-    if keep and keep[0]["role"] == "assistant":
-        keep = keep[1:]
-    # 总字数超了就从最早的一轮开始丢
-    while len(keep) > 2 and sum(len(m["content"]) for m in keep) > MAX_HISTORY_CHARS:
-        keep = keep[2:]
-    return keep
+    逻辑在 app/memory.py（normalize_history），这里只做兼容包装：
+    只保留最近 MAX_HISTORY_TURNS 轮；再按总字数截断，超了就从最早的一轮
+    开始丢。返回的一定是整轮。被截掉的轮次由调用方拿 memory.normalize_history
+    的 dropped 再摘要（见 _append_turn_to_history、run），这里不摘要——
+    短历史不产生额外 LLM 调用。"""
+    kept, _dropped = memory.normalize_history(history)
+    return kept
 
 
 def _build_retrieval_query(query: str, history: List[dict]) -> str:
@@ -597,14 +593,18 @@ def _call_llm(prompt: str) -> str:
 def answerer_node(state: State):
     from .rag import build_prompt, build_pubmed_prompt
 
+    # 1.4 压缩：prompt 用的历史不是 state["history"] 原样——历史超限时，
+    # 只拼最近 2 轮完整内容 + 摘要（memory.prompt_history），较早轮次在摘要里；
+    # 没摘要时原样返回，和原来一模一样。
+    prompt_hist = memory.prompt_history(state.get("history") or [], state.get("history_summary") or [])
     pubmed_results = state.get("pubmed_results") or []
     if pubmed_results:
         # PubMed 路径：只用 PubMed 返回的文章回答，本地片段不用——两种引用
         # 体系（PubMed PMID / 本地论文 p.页码）不混在一道答案里，核查也只认 PMID
-        prompt = build_pubmed_prompt(state["query"], pubmed_results, history=state.get("history") or [])
+        prompt = build_pubmed_prompt(state["query"], pubmed_results, history=prompt_hist)
         reminder = PUBMED_RETRY_REMINDER
     elif state["chunks"]:
-        prompt = build_prompt(state["query"], state["chunks"], history=state.get("history") or [])
+        prompt = build_prompt(state["query"], state["chunks"], history=prompt_hist)
         reminder = RETRY_REMINDER
     else:
         return {"draft": REFUSAL}
@@ -622,14 +622,19 @@ def answerer_node(state: State):
     return {"draft": draft}
 
 
-def _append_turn_to_history(state: State, final: str) -> List[dict]:
+def _append_turn_to_history(state: State, final: str) -> dict:
     """把本轮（一问一答）追加到历史里，供 checkpointer 持久化。
     只在核查员给出最终答案时调（重试时不调，那轮还没定论）。
-    历史照样只留最近 6 轮、4000 字（_normalize_history 的上限）。"""
+    历史照样只留最近 6 轮、4000 字（memory.normalize_history 的上限）；
+    被截掉的轮次先摘要进 history_summary（调一次 LLM，失败退回规则式），
+    再丢——摘要写进 State，不丢信息；短历史不截断、不调 LLM，和原来一样。
+    返回 {"history": ..., "history_summary": ...}，调用方用 ** 展开进返回的 state。"""
     history = list(state.get("history") or [])
     history.append({"role": "user", "content": state.get("query", "")})
     history.append({"role": "assistant", "content": final})
-    return _normalize_history(history)
+    kept, dropped = memory.normalize_history(history)
+    new_summary = memory.append_summary(state.get("history_summary") or "", dropped, llm_call=_call_llm)
+    return {"history": kept, "history_summary": new_summary}
 
 
 def _refusal_status(draft: str) -> str:
@@ -647,7 +652,7 @@ def _verification_failed(state: State, reason: str) -> dict:
     if retries < MAX_RETRIES:
         return {"final": "", "retry": True, "retries": retries + 1}
     return {"final": REFUSAL, "answer_status": "refused", "retry": False,
-            "history": _append_turn_to_history(state, REFUSAL)}
+            **_append_turn_to_history(state, REFUSAL)}
 
 
 def _verify_pubmed(state: State, draft: str, pubmed_results: list) -> dict:
@@ -665,7 +670,7 @@ def _verify_pubmed(state: State, draft: str, pubmed_results: list) -> dict:
     if local_cites:
         return _verification_failed(state, "PubMed 回答里混入了本地式引用")
     return {"final": draft, "answer_status": "verified", "retry": False,
-            "history": _append_turn_to_history(state, draft)}
+            **_append_turn_to_history(state, draft)}
 
 
 def verifier_node(state: State):
@@ -677,13 +682,13 @@ def verifier_node(state: State):
         if draft == REFUSAL or draft.startswith("[待接 LLM]"):
             final = draft
             return {"final": final, "answer_status": _refusal_status(draft), "retry": False,
-                    "history": _append_turn_to_history(state, final)}
+                    **_append_turn_to_history(state, final)}
         return _verify_pubmed(state, draft, pubmed_results)
     if not state.get("chunks") or draft == REFUSAL or draft.startswith("[待接 LLM]"):
         # 没片段、回答员本来就拒答、LLM 没调通：重试也没用，直接结束
         final = REFUSAL if not state.get("chunks") else draft
         return {"final": final, "answer_status": _refusal_status(final), "retry": False,
-                "history": _append_turn_to_history(state, final)}
+                **_append_turn_to_history(state, final)}
     cited = set((m.group(1), m.group(2)) for m in CITE_RE.finditer(draft))
     real = set(
         (str(c.get("source", "未知")), str(c.get("page", "?"))) for c in state["chunks"]
@@ -696,7 +701,7 @@ def verifier_node(state: State):
         bad = sorted(cited - real)
         return _verification_failed(state, f"引用不在检索结果中：{bad}")
     return {"final": draft, "answer_status": "verified", "retry": False,
-            "history": _append_turn_to_history(state, draft)}
+            **_append_turn_to_history(state, draft)}
 
 
 def _route_after_verifier(state: State) -> str:
@@ -740,6 +745,19 @@ def _restore_history(graph, config) -> List[dict]:
     if not snapshot or not snapshot.values:
         return []
     return snapshot.values.get("history") or []
+
+
+def _restore_history_summary(graph, config) -> str:
+    """从 checkpointer 里恢复上次保存的历史摘要（1.4，和 history 一起存）。
+    没存过、读失败都返回 ""——摘要只是 prompt 上下文，没有也能问答。"""
+    try:
+        snapshot = graph.get_state(config)
+    except Exception as e:
+        print(f"[checkpointer] 恢复历史摘要失败（{e}），按无摘要处理")
+        return ""
+    if not snapshot or not snapshot.values:
+        return ""
+    return snapshot.values.get("history_summary") or ""
 
 
 def _build_graph(checkpointer=None):
@@ -853,13 +871,17 @@ def _run_sequential(initial: dict) -> dict:
 
 def _run_with_graph(query: str, history=None, use_pubmed: bool = True) -> dict:
     """无持久化的问答路径（原来的 run 逻辑）：建图、invoke，
-    图不可用时退回顺序执行。"""
-    history = _normalize_history(history)
+    图不可用时退回顺序执行。
+    1.4：传入的历史超限时，被截掉的轮次先摘要进 history_summary（调一次 LLM，
+    失败退回规则式），再丢；短历史不截断、不调 LLM，和原来一样。"""
+    kept, dropped = memory.normalize_history(history)
+    history_summary = memory.append_summary("", dropped, llm_call=_call_llm)
+    history = kept
     retrieval_query = _build_retrieval_query(query, history)
     initial = {
         "query": query, "chunks": [], "draft": "", "final": "", "answer_status": "",
         "route": {}, "plan": {}, "subtasks": [], "tool_calls": [], "figure": {}, "error": "",
-        "history": history, "retrieval_query": retrieval_query,
+        "history": history, "history_summary": history_summary, "retrieval_query": retrieval_query,
         "retries": 0, "retry": False,
         "pubmed_results": [], "use_pubmed": use_pubmed,
     }
@@ -891,14 +913,20 @@ def run(query: str, history=None, thread_id=None, use_pubmed: bool = True) -> di
                     graph = _build_graph(checkpointer)
                     config = {"configurable": {"thread_id": thread_id}}
                     if history is None:
-                        # 没传 history：从 checkpointer 里恢复上一轮的
+                        # 没传 history：从 checkpointer 里恢复上一轮的（历史 + 摘要一起恢复）
                         history = _restore_history(graph, config)
-                    history = _normalize_history(history)
+                        existing_summary = _restore_history_summary(graph, config)
+                    else:
+                        # 传了 history：用传来的，摘要从传入的历史现算（不用库里的）
+                        existing_summary = ""
+                    kept, dropped = memory.normalize_history(history)
+                    history_summary = memory.append_summary(existing_summary, dropped, llm_call=_call_llm)
+                    history = kept
                     retrieval_query = _build_retrieval_query(query, history)
                     initial = {
                         "query": query, "chunks": [], "draft": "", "final": "", "answer_status": "",
                         "route": {}, "plan": {}, "subtasks": [], "tool_calls": [], "figure": {}, "error": "",
-                        "history": history, "retrieval_query": retrieval_query,
+                        "history": history, "history_summary": history_summary, "retrieval_query": retrieval_query,
                         "retries": 0, "retry": False,
                         "pubmed_results": [], "use_pubmed": use_pubmed,
                     }
