@@ -111,3 +111,50 @@ def test_ask_accepts_thread_id(monkeypatch, tmp_path):
     resp3 = client.post("/ask/stream", json={"query": "那白质呢？", "thread_id": "t1"})
     assert resp3.status_code == 200
     assert "text/event-stream" in resp3.headers["content-type"]
+
+
+def test_get_session_returns_history(monkeypatch, tmp_path):
+    """GET /sessions/{id} 返回该会话的历史：一轮问答后是两条。"""
+    _setup(monkeypatch, tmp_path)
+    client = TestClient(app)
+    resp = client.post("/ask", json={"query": "总白质体积在几岁达到峰值？", "thread_id": "t1"})
+    assert resp.status_code == 200
+    resp = client.get("/sessions/t1")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["thread_id"] == "t1"
+    assert body["history"][0] == {"role": "user", "content": "总白质体积在几岁达到峰值？"}
+    assert body["history"][1] == {"role": "assistant", "content": ANSWER}
+
+
+def test_get_session_returns_multi_turn_history(monkeypatch, tmp_path):
+    """两轮之后 history 有四条，按时间顺序。"""
+    _setup(monkeypatch, tmp_path)
+    client = TestClient(app)
+    client.post("/ask", json={"query": "总白质体积在几岁达到峰值？", "thread_id": "t1"})
+    client.post("/ask", json={"query": "那白质呢？", "thread_id": "t1"})
+    resp = client.get("/sessions/t1")
+    assert resp.status_code == 200
+    history = resp.json()["history"]
+    assert len(history) == 4
+    assert history[0]["content"] == "总白质体积在几岁达到峰值？"
+    assert history[2]["content"] == "那白质呢？"
+
+
+def test_get_session_unknown_returns_empty(monkeypatch, tmp_path):
+    """没问过的会话 id 返回空 history，不 404。"""
+    _setup(monkeypatch, tmp_path)
+    client = TestClient(app)
+    resp = client.get("/sessions/never-asked")
+    assert resp.status_code == 200
+    assert resp.json() == {"thread_id": "never-asked", "history": []}
+
+
+def test_get_session_checkpointer_unavailable_returns_empty(monkeypatch, tmp_path):
+    """checkpointer 不可用时查询接口不挂，返回空 history。"""
+    _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr("app.main._get_checkpointer_cm", lambda: None)
+    client = TestClient(app)
+    resp = client.get("/sessions/t1")
+    assert resp.status_code == 200
+    assert resp.json() == {"thread_id": "t1", "history": []}
