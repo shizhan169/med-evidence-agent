@@ -399,9 +399,10 @@ class _FakeChatCompletions:
 class _FakeOpenAI:
     instances = []
 
-    def __init__(self, api_key=None, base_url=None):
+    def __init__(self, api_key=None, base_url=None, timeout=None):
         self.api_key = api_key
         self.base_url = base_url
+        self.timeout = timeout
         self.chat = type("Chat", (), {"completions": _FakeChatCompletions("图里有三幅面板")})()
         _FakeOpenAI.instances.append(self)
 

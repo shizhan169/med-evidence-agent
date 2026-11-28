@@ -87,21 +87,20 @@ def test_stream_error_event_carries_request_id(monkeypatch):
 
 
 def test_ask_structured_error(monkeypatch):
-    """run 抛异常时 /ask 返回结构化错误，不是笼统的 500。
-    注意：注册给 Exception 的 handler 在 Starlette 里是 ServerErrorMiddleware
-    的 500 处理器，它发完响应还会继续把异常抛出来，TestClient 默认
-    raise_server_exceptions=True 会把它再抛回测试里，所以这里要关掉；
-    真实部署（uvicorn）下客户端收到的是结构化 500 响应。"""
+    """run 抛异常时 /ask 返回结构化错误响应，不是笼统的 500。
+    Harness（3.1）接管后：/ask 内部捕获异常，返回 200 + answer_status="error"
+    的 AskResponse，answer 是友好文本（不泄露内部异常细节）；超时时
+    answer 会说明超时。真正的 500 处理器只兜底 /ask 之外的异常
+    （中间件、其他接口）。"""
     monkeypatch.setattr("app.main.run", lambda query, history=None, **kw: (_ for _ in ()).throw(RuntimeError("检索挂了")))
-    client = TestClient(app, raise_server_exceptions=False)
+    client = TestClient(app)
     resp = client.post("/ask", json={"query": "总白质体积在几岁达到峰值？"})
-    assert resp.status_code == 500
+    assert resp.status_code == 200
     data = resp.json()
-    assert set(data.keys()) == {"error"}
-    err = data["error"]
-    assert err["code"] == "internal_error"
-    assert "检索挂了" in err["message"]
-    assert err["request_id"] == resp.headers.get(REQUEST_ID_HEADER)
+    assert data["answer_status"] == "error"
+    assert data["verified"] is False
+    assert data["answer"] == "问答失败，请稍后重试。"
+    assert resp.headers.get(REQUEST_ID_HEADER)
 
 
 def test_validation_error_unchanged(monkeypatch):
