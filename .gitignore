@@ -8,6 +8,8 @@ eval/results.json
 eval/results.md
 eval/results_prev.json
 eval/results_compare.md
+eval/results_frozen.json
+eval/results_frozen.md
 .venv/
 # 本地下载的 embedding 模型（约 90MB），不进仓库
 models/

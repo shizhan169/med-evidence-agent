@@ -46,6 +46,7 @@
     需要 run() 返回实际调了哪些工具，那是 app 层的改动，这里不做。
 """
 
+import argparse
 import json
 import re
 import sys
@@ -64,6 +65,11 @@ from app.agent import router_node, run  # noqa: E402
 QUESTIONS_FILE = ROOT / "eval" / "test_questions.md"
 RESULTS_JSON = ROOT / "eval" / "results.json"
 RESULTS_MD = ROOT / "eval" / "results.md"
+# 冻结测试题（阶段验收专用）：T01–T10，只在阶段验收时跑一次。
+# 单独的题目文件和结果文件，不覆盖开发集的 results.json。
+FROZEN_QUESTIONS_FILE = ROOT / "eval" / "datasets" / "test_questions_frozen.md"
+FROZEN_RESULTS_JSON = ROOT / "eval" / "results_frozen.json"
+FROZEN_RESULTS_MD = ROOT / "eval" / "results_frozen.md"
 
 BLOCK_RE = re.compile(r"^###\s+(Q\d+|R\d+|FR\d+|F\d+|T\d+)\s*$", re.M)
 FIELD_RE = re.compile(r"^(问题|类型|预期答案|预期来源|拒答原因)：(.*)$")
@@ -485,8 +491,13 @@ def run_sequence(seq: dict, run_fn, router_fn=None) -> list:
     return records
 
 
-def main():
-    questions = parse_questions(QUESTIONS_FILE)
+def main(frozen: bool = False):
+    # 冻结测试（--frozen）：只跑 T01–T10，结果写 results_frozen.json/md，
+    # 不覆盖开发集的 results.json；多轮序列 MT01 是开发集专用的，冻结跑跳过。
+    questions_file = FROZEN_QUESTIONS_FILE if frozen else QUESTIONS_FILE
+    results_json = FROZEN_RESULTS_JSON if frozen else RESULTS_JSON
+    results_md = FROZEN_RESULTS_MD if frozen else RESULTS_MD
+    questions = parse_questions(questions_file)
     print(f"共加载 {len(questions)} 道题，开始评测……")
     records = []
     t0 = time.time()
@@ -519,7 +530,12 @@ def main():
         print(f"    结果：{'拒答' if rec['refused'] else '已回答'}，核查通过：{rec['verified']}，"
               f"引用：{rec['citation_status']}，路由：{'对' if rec['route_correct'] else '错' if rec['route_correct'] is False else '未知'}")
     # ---- 多轮序列：按顺序跑追问题，每轮把历史传给 agent ----
-    for seq in MULTITURN_SEQUENCES:
+    # 冻结测试没有多轮题，跳过（MT01 是开发集专用的）。
+    if frozen:
+        multiturn_sequences = []
+    else:
+        multiturn_sequences = MULTITURN_SEQUENCES
+    for seq in multiturn_sequences:
         print(f"多轮序列 {seq['id']}：{seq['title']}")
         seq_records = run_sequence(seq, run, router_node)
         for sr in seq_records:
@@ -545,7 +561,7 @@ def main():
         summary["multiturn"], summary["timing"],
     )
 
-    RESULTS_JSON.write_text(
+    results_json.write_text(
         json.dumps({"summary": summary, "records": records}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -645,7 +661,7 @@ def main():
         "- 完整回答原文见 eval/results.json。",
         "",
     ]
-    RESULTS_MD.write_text("\n".join(lines), encoding="utf-8")
+    results_md.write_text("\n".join(lines), encoding="utf-8")
 
     print()
     print("评测完成：")
@@ -664,9 +680,13 @@ def main():
           f"引用准确率 {vlm_s['citation_accuracy']:.1%}，走 vision 路由 {vlm_s['vision_routed']}/{vlm_s['total']}")
     print(f"  多轮序列：{mt_s['total_turns']} 轮，{len(mt_s['sequences'])} 个序列")
     print(f"  耗时：总 {timing_s['total_seconds']} 秒，平均每题 {timing_s['mean_seconds']} 秒")
-    print(f"  结果已写入 {RESULTS_JSON}")
-    print(f"  总结已写入 {RESULTS_MD}")
+    print(f"  结果已写入 {results_json}")
+    print(f"  总结已写入 {results_md}")
 
 
 if __name__ == "__main__":
-    main()
+    _parser = argparse.ArgumentParser(description="MedEvidence 评测：开发集或冻结测试集")
+    _parser.add_argument("--frozen", action="store_true",
+                         help="跑冻结测试集 T01–T10（阶段验收专用），结果写 results_frozen.json/md")
+    _args = _parser.parse_args()
+    main(frozen=_args.frozen)

@@ -4,9 +4,19 @@
 和开发集的 Q/R/F 区分开。parse_questions 必须认 T 题号，否则冻结文件
 只是个文档，验收时跑不起来。
 """
+import inspect
 from pathlib import Path
 
-from eval.run_eval import parse_questions
+from eval.run_eval import (
+    FROZEN_QUESTIONS_FILE,
+    FROZEN_RESULTS_JSON,
+    FROZEN_RESULTS_MD,
+    QUESTIONS_FILE,
+    RESULTS_JSON,
+    RESULTS_MD,
+    main,
+    parse_questions,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 FROZEN_FILE = ROOT / "eval" / "datasets" / "test_questions_frozen.md"
@@ -30,3 +40,15 @@ def test_frozen_questions_parse():
     assert all(n == 2 for n in files.values())
     # 注意：4 篇新论文的 PDF 还在用户本地，VM 的 data/papers/ 里没有，
     # 这里不 assert 文件存在；验收跑题之前要先把 4 篇同步进来再入库。
+
+
+def test_frozen_runner_uses_separate_files():
+    """--frozen 跑冻结集：题目文件、结果文件都和开发集分开，
+    冻结跑不会覆盖开发集的 results.json。"""
+    assert FROZEN_QUESTIONS_FILE == FROZEN_FILE
+    assert FROZEN_QUESTIONS_FILE != QUESTIONS_FILE
+    assert FROZEN_RESULTS_JSON != RESULTS_JSON
+    assert FROZEN_RESULTS_MD != RESULTS_MD
+    assert FROZEN_RESULTS_JSON.name == "results_frozen.json"
+    assert FROZEN_RESULTS_MD.name == "results_frozen.md"
+    assert "frozen" in inspect.signature(main).parameters
