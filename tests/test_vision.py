@@ -152,6 +152,19 @@ def test_read_chart_mock_f01():
     assert result["reading"] == F01_READING
 
 
+def test_read_chart_caption_page_has_no_image():
+    # 回归：Fujita 图 4 的图注在 p.7，图本身在 p.8，p.7 一张图片都没有。
+    # 2026-11-28 用户本地验证：chart_locate 给的是图注页 p.7，read_chart
+    # 直接渲染 p.7，VLM 只看到图注文字、看不到图（还以为图里没图表）。
+    # 修法：_find_figure_page 先确认图实际在哪页，没图就往附近页找。
+    fake = _FakeVLM(F02_READING)
+    result = vision.read_chart(FUJITA, 7, 4, "Fujita 2023 的图 4 展示的是什么？",
+                               caption=FIG4_CAPTION, vlm_call=fake)
+    assert result["available"] is True
+    assert result["page"] == 8  # 图注页 p.7 没图，自动切到有图的 p.8
+    assert len(fake.calls) == 1
+
+
 def test_read_chart_no_crop():
     fake = _FakeVLM(F02_READING)
     result = vision.read_chart(FUJITA, 8, 4, "图 4 展示什么？",

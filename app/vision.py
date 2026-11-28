@@ -214,14 +214,41 @@ def call_vlm(image_bytes, question, caption="", vlm_call=None):
     return fn(image_bytes, prompt)
 
 
+def _find_figure_page(pdf_path, page):
+    """图实际在哪页：图注所在的页不一定有图（Fujita 图 4 的图注在 p.7，
+    图本身在 p.8，p.7 一张图片都没有）。先看图注页有没有图片，
+    没有就往附近页找（+1、-1、+2、-2），找到有图片的页就用它；
+    附近都没有图片时退回原页（调用方按老路走，不中断）。
+    返回 (page, found_images)。"""
+    import pymupdf
+
+    doc = pymupdf.open(str(pdf_path))
+    try:
+        total = len(doc)
+        for cand in [page, page + 1, page - 1, page + 2, page - 2]:
+            if cand < 1 or cand > total:
+                continue
+            if doc[cand - 1].get_images():
+                return cand, True
+        return page, False
+    finally:
+        doc.close()
+
+
 def read_chart(pdf_path, page, figure_no, question, caption="",
                vlm_call=None, dpi=DEFAULT_DPI, crop=True):
     """读一张图（P0 + P1）：定位、渲染（能裁就裁）、VLM、数字交叉核对。
     返回结构化结果；任何一步失败都返回 available=False（不抛异常），
     调用方按“证据不足/部分回答”走。
     成功时：available=True，reading 是 VLM 原文，verification 是交叉核对结果，
-    downgraded=True 表示有数字在图注里对不上（只降级说明，不删除）。"""
+    downgraded=True 表示有数字在图注里对不上（只降级说明，不删除）。
+    注意：先由 _find_figure_page 确认图实际在哪页——图注页不一定有图，
+    读错页时 VLM 只能看到图注文字、看不到图。"""
     source = Path(pdf_path).name
+    try:
+        page, _has_images = _find_figure_page(pdf_path, page)
+    except Exception:
+        pass
     try:
         clip = find_figure_clip(pdf_path, page, figure_no) if crop else None
     except Exception:
