@@ -8,6 +8,7 @@ from fastapi.exceptions import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
+from . import harness
 from .agent import _build_graph, _get_checkpointer_cm, _restore_history, run
 
 logger = logging.getLogger(__name__)
@@ -110,9 +111,20 @@ def get_session(session_id: str):
 
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest, request: Request):
+    # request_id 优先用中间件的（和日志、响应头、SSE 事件同一个 ID）；
+    # 中间件没跑到时生成一个。Harness：整体超时走 run_with_timeout，
+    # 超时或异常都返回 answer_status="error" 的结构化响应，不直接抛 500。
     request_id = _request_id(request)
     logger.info("[%s] agent run start query=%s", request_id, (req.query or "")[:80])
-    result = run(req.query, history=req.history, thread_id=req.thread_id or None)
+    try:
+        result = harness.run_with_timeout(
+            run, harness.RUN_TIMEOUT_SECONDS,
+            req.query, history=req.history, thread_id=req.thread_id or None,
+            request_id=request_id)
+    except Exception as e:
+        print(f"[ask] request_id={request_id} 问答失败：{e}")
+        return AskResponse(answer=harness.error_message(e), verified=False,
+                           answer_status="error", citations=[])
     logger.info("[%s] agent run done answer_status=%s", request_id,
                 result.get("answer_status", "refused"))
     return AskResponse(answer=result["answer"], verified=result["verified"],
@@ -160,10 +172,16 @@ def ask_stream(req: AskRequest, request: Request):
 
     def events():
         try:
-            result = run(req.query, history=req.history, thread_id=req.thread_id or None)
+            result = harness.run_with_timeout(
+                run, harness.RUN_TIMEOUT_SECONDS,
+                req.query, history=req.history, thread_id=req.thread_id or None,
+                request_id=request_id)
         except Exception as e:
+            # 超时用友好文本；其他异常保留原始信息（流式是调试路径，
+            # 现有测试要求 error 事件里能看到原始异常）。
+            message = harness.error_message(e) if isinstance(e, harness.HarnessTimeout) else str(e)
             logger.exception("[%s] agent run error: %s", request_id, e)
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e), 'request_id': request_id}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': message, 'request_id': request_id}, ensure_ascii=False)}\n\n"
             return
         logger.info("[%s] agent run done answer_status=%s", request_id,
                     result.get("answer_status", "refused"))

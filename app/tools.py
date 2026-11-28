@@ -17,6 +17,7 @@ import re
 from pathlib import Path
 
 from .config import CHROMA_DIR
+from .harness import validate_tool_params
 
 # 图注文本的开头格式（见 ingest._extract_captions）："Figure 3. ..." / "Table 2. ..."
 _FIGURE_RE = re.compile(r"^(Figure|Table)\s*(\d+)", re.IGNORECASE)
@@ -86,6 +87,12 @@ def call_tool(name: str, **kwargs) -> dict:
             return {"success": False, "data": None, "error": f"工具 {name} 缺少必填参数 {pname}"}
         elif "default" in spec:
             call_kwargs[pname] = spec["default"]
+    # Harness（3.4）：白名单 + 类型过了，还要过值域——防 LLM 生成的参数
+    # 把问答带偏（top_k 过大拖慢检索、query 过长撑爆 prompt、
+    # image_path 越出数据目录读任意文件）。不通过按失败分支走，不抛异常。
+    param_error = validate_tool_params(name, call_kwargs)
+    if param_error:
+        return {"success": False, "data": None, "error": param_error}
     try:
         data = tool.func(**call_kwargs)
     except Exception as e:
