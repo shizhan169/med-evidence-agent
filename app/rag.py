@@ -571,6 +571,41 @@ def _distinct_sources(collection) -> list:
     })
 
 
+_COMPARISON_DIMENSIONS = (
+    (r"数据集|队列|样本|人群|纵向设计|\b(?:datasets?|cohorts?|sample size|study population)\b",
+     "What was the total study population? Total number of participants or healthy individuals "
+     "included in the study, number of datasets, age range and sex distribution."),
+    (r"变量|暴露|结局定义|结局指标|\b(?:variables?|predictors?|covariates?|outcome measures?)\b",
+     "What target measure did the models predict from the input features? Which predictors "
+     "and covariates were included during model training and prediction?"),
+    (r"模型|算法|常模构建方法|建模方法|\b(?:statistical models?|algorithms?|modelling methods?|modeling methods?)\b",
+     "Which statistical algorithms and regression models were trained and compared for normative modelling?"),
+    (r"结果(?!变量)|常模发现|关键估计|主要发现|关键发现|\b(?:results?|findings?|predictive performance)\b",
+     "What were the main findings and results for the predictive performance and accuracy of the models?"),
+    (r"局限|偏倚|外部效度限制|未解决的?问题|\b(?:limitations?|biases|external validity)\b",
+     "What limitations did the authors report about the study sample, generalisability, and longitudinal follow-up?"),
+)
+
+
+def _comparison_content_query(query: str, named: list) -> str:
+    """点名只用于选论文。给单一维度补英文检索词，同时保留原问的具体限定。"""
+    citations = {author + year for year, author in map(_source_author_year, named) if author and year}
+    def strip_citation(match: re.Match) -> str:
+        # 只删与文件对应的作者年份，保留英文作者前的限定词，如 "ABCD in Ge 2024"。
+        phrase = match[0]
+        for word in re.finditer(r"[A-Za-zÀ-ž]+", phrase):
+            if _norm_key(phrase[word.start():]) in citations:
+                return phrase[:word.start()]
+        return phrase
+
+    subject = re.sub(r"[A-Za-zÀ-ž]+(?:[ -][A-Za-zÀ-ž]+)*\s*[(（]?\d{4}(?!\d)[)）]?", strip_citation, query)
+    dimensions = [prompt for terms, prompt in _COMPARISON_DIMENSIONS if re.search(terms, subject, re.I)]
+    if len(dimensions) == 1:
+        subject = subject.strip(" 、，,和与")
+        return f"{dimensions[0]} {subject}"
+    return ""
+
+
 def _retrieve_per_paper(collection, vector_query: str, tokens: list, named: list, top_k: int) -> list:
     """多篇点名时的检索：每篇各取一份证据再合并。
     每篇：向量（where 过滤）+ BM25（source 过滤）各取一个候选池，
@@ -609,12 +644,13 @@ def retrieve(query: str, top_k: int = 10, llm_call=None):
     except Exception as e:
         print(f"[retrieve] Chroma 不可用：{e}")
         return []
-    # 向量检索用英文：中文问题先翻英文（跨语言向量检索弱）
-    vector_query = translate_query_to_english(query, llm_call=llm_call)
-    tokens = _query_tokens(query)
     # 多篇点名时按篇取：每篇各取一份证据，防止综述挤掉原文。
     # 单篇或没点名时走原有逻辑，行为不变。
     named = _named_papers(query, _distinct_sources(collection))
+    # 已按文件过滤时，两路都用维度内容排名，避免作者和年份把参考文献推到前面。
+    content_query = _comparison_content_query(query, named) if len(named) >= 2 else ""
+    vector_query = content_query or translate_query_to_english(query, llm_call=llm_call)
+    tokens = _query_tokens(content_query or query)
     use_rerank = _get_reranker() is not None
     if len(named) >= 2:
         fused = _retrieve_per_paper(collection, vector_query, tokens, named, top_k)

@@ -7,6 +7,8 @@ Chroma 用 test_rerank.py 同款的假 embedding + 临时目录。
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -399,3 +401,54 @@ def test_retrieve_single_paper_uses_global_path(monkeypatch):
     assert seen["where"] is None
     assert seen["source"] is None
     assert [x["text"] for x in out] == ["alpha", "beta"]
+
+
+@pytest.mark.parametrize(("question", "expected_terms"), [
+    ("各使用了什么数据集、样本、人群和纵向设计？", {"datasets", "participants"}),
+    ("在建模中分别纳入哪些变量、协变量、暴露或结局定义？", {"predictors", "covariates"}),
+    ("纵向常模论文建模中使用的结果变量、预测变量、协变量和时间变量", {"predictors", "covariates"}),
+    ("各自采用的统计模型或纵向常模构建方法", {"algorithms", "regression"}),
+    ("的主要结果、常模发现或关键估计是什么？", {"findings", "performance"}),
+    ("分别报告了哪些局限性、偏倚或外部效度限制？", {"limitations", "generalisability"}),
+])
+def test_named_comparison_ranks_by_dimension(monkeypatch, question, expected_terms):
+    query = "Bethlehem 2022、Di Biase 2023、Ge 2024、Seidel 2026 和 Rutherford 2022 " + question
+    monkeypatch.setattr(rag, "get_collection", lambda: object())
+    monkeypatch.setattr(rag, "_distinct_sources", lambda c: _SOURCES)
+    monkeypatch.setattr(rag, "_get_reranker", lambda: None)
+
+    def check_inputs(collection, vector_query, tokens, named, top_k):
+        assert named == _SOURCES[:6]
+        assert top_k == 10
+        assert expected_terms <= set(tokens)
+        assert tokens == rag._query_tokens(vector_query)
+        assert set(tokens).isdisjoint(rag._query_tokens(query))
+        return []
+
+    monkeypatch.setattr(rag, "_retrieve_per_paper", check_inputs)
+    rag.retrieve(query, llm_call=lambda _: pytest.fail("通用维度无需调用翻译模型"))
+
+
+@pytest.mark.parametrize(("question", "qualifier"), [
+    ("五篇纵向常模论文分别使用了哪些数据集、样本量、人群特征和随访时长？", "随访时长"),
+    ("在四年随访时的主要结果", "四年随访"),
+    ("图 4 的结果", "图 4"),
+    ("使用的 MFPR 模型", "MFPR"),
+    ("在 ABCD 中的主要结果", "ABCD"),
+])
+def test_comparison_keeps_qualifiers(question, qualifier):
+    content = rag._comparison_content_query("Ge 2024 和 Seidel 2026 " + question, _SOURCES[2:4])
+    assert qualifier in content
+    assert "Ge 2024" not in content and "Seidel 2026" not in content
+
+
+def test_english_comparison_strips_only_named_citations():
+    query = "Compare ABCD in Ge 2024 and Seidel 2026: datasets, sample size and population characteristics"
+    content = rag._comparison_content_query(query, _SOURCES[2:4])
+    assert {"abcd", "participants", "datasets"} <= set(rag._query_tokens(content))
+    assert {"ge", "seidel", "2024", "2026"}.isdisjoint(rag._query_tokens(content))
+
+
+@pytest.mark.parametrize("question", ["的数据集、模型和结果", "图 4 中的蓝线表示什么？"])
+def test_mixed_or_unknown_comparison_uses_existing_retrieval(question):
+    assert not rag._comparison_content_query("Ge 2024 和 Seidel 2026 " + question, _SOURCES[2:4])
