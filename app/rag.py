@@ -232,10 +232,11 @@ def _get_bm25_index(collection):
     return index, chunks
 
 
-def _keyword_chunks(collection, tokens: list, limit: int = 5, exclude_ids=None) -> list:
+def _keyword_chunks(collection, tokens: list, limit: int = 5, exclude_ids=None, source: str = None) -> list:
     """关键词检索：BM25 打分取前 limit 个（跳过向量已召回的）。
 
     rank_bm25 没装时退回 token 计数兜底（效果差一截，但不断）。
+    source 传了就只取那篇论文的片段——多篇点名时按篇取就靠它。
     """
     if not tokens:
         return []
@@ -251,6 +252,8 @@ def _keyword_chunks(collection, tokens: list, limit: int = 5, exclude_ids=None) 
             if scores[i] <= 0:
                 break
             c = chunks[i]
+            if source is not None and c["source"] != source:
+                continue
             if c["id"] in exclude_ids:
                 continue
             # 带上 id：retrieve() 做 RRF 融合时按 id 去重（同一片段在向量和
@@ -270,6 +273,8 @@ def _keyword_chunks(collection, tokens: list, limit: int = 5, exclude_ids=None) 
     scored = []
     for doc, meta, cid in zip(docs, metas, ids):
         if cid in exclude_ids:
+            continue
+        if source is not None and meta.get("source") != source:
             continue
         text = (doc or "").lower()
         hits = sum(1 for t in tokens if t in text)
@@ -416,11 +421,16 @@ def format_citation(chunk: dict) -> str:
     return f"[来源：{chunk.get('source', '未知')} p.{chunk.get('page', '?')}]"
 
 
-def _vector_chunks(collection, query: str, limit: int) -> list:
+def _vector_chunks(collection, query: str, limit: int, where: dict = None) -> list:
     """向量检索：按问题向量取前 limit 个片段。失败返回 []，检索不断。
-    返回的片段带 "id"（RRF 融合按 id 去重），最终返回前再去掉。"""
+    返回的片段带 "id"（RRF 融合按 id 去重），最终返回前再去掉。
+    where 是 Chroma 的 metadata 过滤（比如 {"source": "2022-bethlehem-brain-charts.pdf"}），
+    传了就只在那篇论文里查——多篇点名时按篇取就靠它。"""
     try:
-        res = collection.query(query_texts=[query], n_results=limit)
+        kwargs = {"query_texts": [query], "n_results": limit}
+        if where:
+            kwargs["where"] = where
+        res = collection.query(**kwargs)
         docs = (res.get("documents") or [[]])[0]
         metas = (res.get("metadatas") or [[]])[0]
         ids = (res.get("ids") or [[]])[0]
@@ -489,6 +499,94 @@ def _drop_ids(chunks: list) -> list:
     return [{k: v for k, v in c.items() if k != "id"} for c in chunks]
 
 
+def _norm_key(text: str) -> str:
+    """归一化成“去重音、小写、只剩字母数字”的 key，供论文名匹配用。
+    Di Biase→dibiase、Coupé→coupe、Rehak-Buckova→rehakbuckova。"""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]", "", t.lower())
+
+
+def _source_author_year(source: str):
+    """从源文件名解析 (年份, 作者 key)。
+    文件名一般是 YYYY-author-....pdf：年份是第一个 token，作者是年份后
+    第一个 token（Di Biase 在文件名里连写成 dibiase，Coupé 去重音成 coupe，
+    Rehak-Buckova 的第一个 token rehak 已足够区分）。
+    解析不到返回 (None, None)。"""
+    base = (source or "").lower()
+    if base.endswith(".pdf"):
+        base = base[:-4]
+    parts = [p for p in re.split(r"[-_]", base) if p]
+    if not parts or not re.fullmatch(r"\d{4}", parts[0]):
+        return None, None
+    year = parts[0]
+    if len(parts) < 2:
+        return year, None
+    return year, _norm_key(parts[1]) or None
+
+
+def _named_papers(query: str, sources: list) -> list:
+    """从问题里找出被点名的论文（返回源文件名列表，去重）。
+    规则：作者 key 长度 >= 4 时，出现在问题里即算点名；
+    短作者名（ge/ho/kia 这类，长度 < 4）必须作者和年份同时出现在问题里，
+    否则 "ge" 会误匹配 general/genetic 这类词。
+    同一 (作者, 年份) 有多篇时全算上（比如 Rutherford 2022 有脑生长和
+    精神病学框架两篇），检索层都取，回答员按内容区分。"""
+    q_norm = _norm_key(query)
+    q_tokens = set(_tokenize(query))
+    named = []
+    for src in sources or []:
+        year, author = _source_author_year(src)
+        if not author:
+            continue
+        hit = False
+        if len(author) >= 4:
+            if author in q_tokens or author in q_norm:
+                hit = True
+        else:
+            if year and author in q_tokens and year in q_tokens:
+                hit = True
+        if hit and src not in named:
+            named.append(src)
+    return named
+
+
+def _distinct_sources(collection) -> list:
+    """库里所有源文件名（去重、排序）。
+    BM25 缓存里已有全库片段，直接用它；BM25 不可用时退回 collection.get。"""
+    try:
+        _, chunks = _get_bm25_index(collection)
+    except Exception:
+        chunks = []
+    if chunks:
+        return sorted({c.get("source", "") for c in chunks if c.get("source")})
+    try:
+        data = collection.get(include=["metadatas"])
+    except Exception:
+        return []
+    return sorted({
+        (m or {}).get("source", "")
+        for m in (data.get("metadatas") or [])
+        if (m or {}).get("source")
+    })
+
+
+def _retrieve_per_paper(collection, vector_query: str, tokens: list, named: list, top_k: int) -> list:
+    """多篇点名时的检索：每篇各取一份证据再合并。
+    每篇：向量（where 过滤）+ BM25（source 过滤）各取一个候选池，
+    RRF 融合取 per_paper_k 个；各篇结果拼起来，调用方再按原有逻辑
+    组装（去重 + 12000 字预算截断）。per_paper_k 保证每篇至少 2 条，
+    总数和 top_k 差不多。某篇取不到时返回空，不硬凑。"""
+    per_paper_k = max(2, top_k // max(1, len(named)))
+    all_chunks = []
+    for src in named:
+        v = _vector_chunks(collection, vector_query, limit=RRF_POOL_PER_SIDE, where={"source": src})
+        k = _keyword_chunks(collection, tokens, limit=RRF_POOL_PER_SIDE, source=src)
+        fused = _rrf_fuse([v, k], top_k=per_paper_k)
+        all_chunks.extend(fused)
+    return all_chunks
+
+
 def retrieve(query: str, top_k: int = 10, llm_call=None):
     """混合检索：Query 改写（调用方在 _build_retrieval_query 里做）→
     向量 + BM25 各取一个候选池 → RRF 融合 → (重排) → 组装去重 → 返回。
@@ -498,6 +596,10 @@ def retrieve(query: str, top_k: int = 10, llm_call=None):
     翻译失败时用原问题查向量，不抛异常。llm_call 是调用方传进来的 LLM
     （retriever_node 传 _call_llm）；不传时不翻译，只用原问题检索。
     库为空返回 []，走拒答分支；不要编造片段。
+
+    多篇点名时按篇取（2026-11-28，B 方案）：问题里点了 2 篇以上论文时，
+    每篇各取一份证据再合并，防止同时提到多篇的综述把各篇原文挤出前 10
+    （五篇对比表就是这么被综述淹掉的）。只点一篇或没点名时走原有逻辑。
 
     重排器保持关闭：_get_reranker() 返回 None 时不重排（生产现状，
     RERANKER_MODEL 指向不存在的路径）；万一哪天模型可用了，仍按老路
@@ -509,14 +611,20 @@ def retrieve(query: str, top_k: int = 10, llm_call=None):
         return []
     # 向量检索用英文：中文问题先翻英文（跨语言向量检索弱）
     vector_query = translate_query_to_english(query, llm_call=llm_call)
-    # 每路先取一个候选池（15+15），RRF 融合后再取 top_k；
-    # 两路独立排名（BM25 不再跳过向量已召回的），同一片段在两路都出现时 RRF 分数相加。
-    vector_chunks = _vector_chunks(collection, vector_query, limit=RRF_POOL_PER_SIDE)
     tokens = _query_tokens(query)
-    keyword_chunks = _keyword_chunks(collection, tokens, limit=RRF_POOL_PER_SIDE)
+    # 多篇点名时按篇取：每篇各取一份证据，防止综述挤掉原文。
+    # 单篇或没点名时走原有逻辑，行为不变。
+    named = _named_papers(query, _distinct_sources(collection))
     use_rerank = _get_reranker() is not None
-    fuse_k = RERANK_POOL_PER_SIDE if use_rerank else top_k
-    fused = _rrf_fuse([vector_chunks, keyword_chunks], top_k=fuse_k)
+    if len(named) >= 2:
+        fused = _retrieve_per_paper(collection, vector_query, tokens, named, top_k)
+    else:
+        # 每路先取一个候选池（15+15），RRF 融合后再取 top_k；
+        # 两路独立排名（BM25 不再跳过向量已召回的），同一片段在两路都出现时 RRF 分数相加。
+        vector_chunks = _vector_chunks(collection, vector_query, limit=RRF_POOL_PER_SIDE)
+        keyword_chunks = _keyword_chunks(collection, tokens, limit=RRF_POOL_PER_SIDE)
+        fuse_k = RERANK_POOL_PER_SIDE if use_rerank else top_k
+        fused = _rrf_fuse([vector_chunks, keyword_chunks], top_k=fuse_k)
     if use_rerank:
         return _drop_ids(_assemble_context(_rerank(query, fused)))
     return _drop_ids(_assemble_context(fused))

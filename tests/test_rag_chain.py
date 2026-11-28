@@ -274,3 +274,128 @@ def test_chroma_telemetry_error_suppressed(caplog):
         lg.error("这条不是遥测报错，应该正常显示")
     assert "Failed to send telemetry event" not in caplog.text
     assert "这条不是遥测报错，应该正常显示" in caplog.text
+
+
+# ---------- 多篇点名时按篇取（2026-11-28，B 方案） ----------
+
+_SOURCES = [
+    "2022-bethlehem-brain-charts.pdf",
+    "2023-dibiase-mapping-brain-charts.pdf",
+    "2024-ge-centilebrain.pdf",
+    "2026-seidel-baseline-cortical-thickness.pdf",
+    "2022-rutherford-brain-growth-aging-precision.pdf",
+    "2022-rutherford-normative-modeling-framework-psychiatry.pdf",
+    "2025-rehak-buckova-normative-models-longitudinal-changes.pdf",
+    "2017-coupe-unified-analysis-brain-maturation-aging.pdf",
+]
+
+
+def test_named_papers_single():
+    assert rag._named_papers(
+        "Bethlehem 2022 的脑图谱研究共汇集了多少 MRI 扫描？", _SOURCES
+    ) == ["2022-bethlehem-brain-charts.pdf"]
+
+
+def test_named_papers_five_papers():
+    out = rag._named_papers(
+        "比较五篇纵向常模论文（Bethlehem 2022、Di Biase 2023、Ge 2024、"
+        "Seidel 2026、Rutherford 2022）的数据集、建模变量、模型、结果和局限性",
+        _SOURCES,
+    )
+    # Rutherford 2022 有两篇（脑生长 + 精神病学框架），都算上，回答员按内容区分
+    assert out == [
+        "2022-bethlehem-brain-charts.pdf",
+        "2023-dibiase-mapping-brain-charts.pdf",
+        "2024-ge-centilebrain.pdf",
+        "2026-seidel-baseline-cortical-thickness.pdf",
+        "2022-rutherford-brain-growth-aging-precision.pdf",
+        "2022-rutherford-normative-modeling-framework-psychiatry.pdf",
+    ]
+
+
+def test_named_papers_short_author_needs_year():
+    # "ge" 太短，不带年份不算点名，避免误匹配 general/genetic
+    assert rag._named_papers(
+        "Ge 的 CentileBrain 研究纳入多少健康人？", _SOURCES
+    ) == []
+    assert rag._named_papers(
+        "Ge 2024 的 CentileBrain 研究纳入多少健康人？", _SOURCES
+    ) == ["2024-ge-centilebrain.pdf"]
+
+
+def test_named_papers_compound_surname_and_accent():
+    assert rag._named_papers(
+        "Rehak-Buckova 2025 的纵向常模综述说了什么？", _SOURCES
+    ) == ["2025-rehak-buckova-normative-models-longitudinal-changes.pdf"]
+    assert rag._named_papers(
+        "Coupé 2017 图 2 的体积轨迹基于多少名受试者？", _SOURCES
+    ) == ["2017-coupe-unified-analysis-brain-maturation-aging.pdf"]
+    assert rag._named_papers("Di Biase 2023 研究用了哪两个队列？", _SOURCES) == [
+        "2023-dibiase-mapping-brain-charts.pdf"
+    ]
+
+
+def test_named_papers_none():
+    assert rag._named_papers("今天上海天气怎么样？", _SOURCES) == []
+    assert rag._named_papers(
+        "用横断面脑图谱推算的年龄相关脑变化率，与纵向实测相比会怎样？", _SOURCES
+    ) == []
+
+
+def test_retrieve_per_paper_each_paper_contributes(monkeypatch):
+    # 五篇点名时，每篇都要有片段进池子，综述不能把原文挤掉。
+    # 假向量/BM25 按 where/source 参数返回对应论文的片段。
+    def fake_vector(collection, query, limit, where=None):
+        src = (where or {}).get("source", "")
+        return [
+            {"id": f"v-{src}-1", "text": f"vec {src} 1", "source": src, "page": 1},
+            {"id": f"v-{src}-2", "text": f"vec {src} 2", "source": src, "page": 2},
+        ]
+
+    def fake_keyword(collection, tokens, limit=5, exclude_ids=None, source=None):
+        return [
+            {"id": f"k-{source}-1", "text": f"kw {source} 1", "source": source, "page": 1},
+        ]
+
+    monkeypatch.setattr(rag, "get_collection", lambda: object())
+    monkeypatch.setattr(rag, "_distinct_sources", lambda c: _SOURCES)
+    monkeypatch.setattr(rag, "_vector_chunks", fake_vector)
+    monkeypatch.setattr(rag, "_keyword_chunks", fake_keyword)
+    monkeypatch.setattr(rag, "_get_reranker", lambda: None)
+    out = rag.retrieve(
+        "比较五篇纵向常模论文（Bethlehem 2022、Di Biase 2023、Ge 2024、"
+        "Seidel 2026、Rutherford 2022）的数据集",
+        top_k=10,
+    )
+    got = {x["source"] for x in out}
+    for src in [
+        "2022-bethlehem-brain-charts.pdf",
+        "2023-dibiase-mapping-brain-charts.pdf",
+        "2024-ge-centilebrain.pdf",
+        "2026-seidel-baseline-cortical-thickness.pdf",
+        "2022-rutherford-brain-growth-aging-precision.pdf",
+    ]:
+        assert src in got, f"{src} 没进检索池"
+
+
+def test_retrieve_single_paper_uses_global_path(monkeypatch):
+    # 只点名一篇时走原有全局逻辑，不按篇取（_vector/_keyword 不带 where/source）。
+    seen = {}
+
+    def fake_vector(collection, query, limit, where=None):
+        seen["where"] = where
+        return [_c("a", "alpha")]
+
+    def fake_keyword(collection, tokens, limit=5, exclude_ids=None, source=None):
+        seen["source"] = source
+        return [_c("b", "beta")]
+
+    monkeypatch.setattr(rag, "get_collection", lambda: object())
+    monkeypatch.setattr(rag, "_distinct_sources", lambda c: _SOURCES)
+    monkeypatch.setattr(rag, "_vector_chunks", fake_vector)
+    monkeypatch.setattr(rag, "_keyword_chunks", fake_keyword)
+    monkeypatch.setattr(rag, "_get_reranker", lambda: None)
+    out = rag.retrieve("Bethlehem 2022 的脑图谱研究共汇集了多少 MRI 扫描？", top_k=10)
+    assert seen["where"] is None
+    assert seen["source"] is None
+    assert [x["text"] for x in out] == ["alpha", "beta"]
