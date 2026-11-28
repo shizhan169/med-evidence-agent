@@ -3,7 +3,7 @@ import json
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from .agent import run
+from .agent import _build_graph, _get_checkpointer_cm, _restore_history, run
 
 app = FastAPI(title="MedEvidence Agent")
 
@@ -27,6 +27,27 @@ class AskResponse(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/sessions/{session_id}")
+def get_session(session_id: str):
+    """查指定会话的历史：GET /sessions/{thread_id}。
+    从 SQLite checkpointer 里读该 thread 的最新状态，返回 history
+    （[{"role": "user"/"assistant", "content": "..."}]，按时间顺序）。
+    没存过这个会话（没用该 thread_id 问过）返回空 history，不 404——
+    会话 id 是调用方随手起的，没记录不代表错了。
+    checkpointer 不可用时也返回空 history，不让查询接口本身挂掉。"""
+    cm = _get_checkpointer_cm()
+    if cm is None:
+        return {"thread_id": session_id, "history": []}
+    try:
+        with cm as checkpointer:
+            graph = _build_graph(checkpointer)
+            config = {"configurable": {"thread_id": session_id}}
+            history = _restore_history(graph, config)
+    except Exception as e:
+        print(f"[sessions] 查会话 {session_id} 失败：{e}")
+        return {"thread_id": session_id, "history": []}
+    return {"thread_id": session_id, "history": history}
 
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
