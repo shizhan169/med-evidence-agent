@@ -257,3 +257,20 @@ def test_retrieve_empty_collection(monkeypatch):
         rag, "get_collection",
         lambda: (_ for _ in ()).throw(RuntimeError("no chroma")))
     assert rag.retrieve("anything") == []
+
+
+# ---------- 屏蔽 ChromaDB 遥测报错（2026-11-28） ----------
+
+def test_chroma_telemetry_error_suppressed(caplog):
+    # ChromaDB 0.5.0 + PostHog 8.x 不兼容，每次建 client / 取集合都会报两条
+    # “Failed to send telemetry event …”，评测输出里刷屏。import app.rag 时
+    # 就给 chromadb.telemetry.product.posthog 这个 logger 装上过滤器，
+    # 只屏蔽这条噪音，其他日志照常。
+    import logging
+
+    lg = logging.getLogger("chromadb.telemetry.product.posthog")
+    with caplog.at_level(logging.ERROR, logger="chromadb.telemetry.product.posthog"):
+        lg.error("Failed to send telemetry event ClientStartEvent: capture() takes 1 positional argument but 3 were given")
+        lg.error("这条不是遥测报错，应该正常显示")
+    assert "Failed to send telemetry event" not in caplog.text
+    assert "这条不是遥测报错，应该正常显示" in caplog.text

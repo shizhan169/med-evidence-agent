@@ -13,10 +13,26 @@ CentileBrain、123,984 等）。BM25 是标准算法（词频 + 逆文档频率�
 但分低。RRF 是融合方式，不是重排模型，和 bge-reranker 是两回事；
 重排器保持关闭（2026-11-25 已验证重排会误杀正确片段，Q05、Q11）。
 """
+import logging
 import re
 
 from .config import CHROMA_DIR, EMBED_MODEL, RERANKER_MODEL
 from .prompts import load_prompt
+
+
+class _SuppressChromaTelemetryError(logging.Filter):
+    """屏蔽 ChromaDB 遥测报错：ChromaDB 0.5.0 调 posthog.capture() 传 3 个
+    位置参数，PostHog 8.x 只接受 1 个，每次建 client / 取集合都会报两条
+    “Failed to send telemetry event …”。ChromaDB 自己会捕获异常、只打日志，
+    不影响检索和评测；这里只屏蔽这条噪音，不动依赖、不改 ChromaDB 行为。"""
+
+    def filter(self, record):
+        return "Failed to send telemetry event" not in record.getMessage()
+
+
+logging.getLogger("chromadb.telemetry.product.posthog").addFilter(
+    _SuppressChromaTelemetryError()
+)
 
 # 回答员的 prompt 模板：存在 prompts/answerer/v1.txt，启动时读进来；
 # 改 prompt 就改那个文件，不用动代码（模板里的 {history_text}、
