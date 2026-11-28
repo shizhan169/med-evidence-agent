@@ -71,9 +71,12 @@ class _FakeChat:
 
 
 class _FakeOpenAI:
-    def __init__(self, api_key=None, base_url=None):
+    # 签名跟真 OpenAI 客户端对齐：_call_llm 会传 timeout（Harness 3.4），
+    # fake 不收就会 TypeError。
+    def __init__(self, api_key=None, base_url=None, timeout=None):
         self.api_key = api_key
         self.base_url = base_url
+        self.timeout = timeout
         self.calls = []
         self.chat = _FakeChat(self)
 

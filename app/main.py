@@ -3,6 +3,7 @@ import json
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from . import harness
 from .agent import run
 
 app = FastAPI(title="MedEvidence Agent")
@@ -30,7 +31,19 @@ def health():
 
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
-    result = run(req.query, history=req.history, thread_id=req.thread_id or None)
+    # Harness（3.1 + 3.4）：每次请求一个 request_id，传给 run 全链路追踪；
+    # 整体超时走 run_with_timeout，超时或异常都返回 answer_status="error"
+    # 的结构化响应，不直接抛 500。
+    request_id = harness.new_request_id()
+    try:
+        result = harness.run_with_timeout(
+            run, harness.RUN_TIMEOUT_SECONDS,
+            req.query, history=req.history, thread_id=req.thread_id or None,
+            request_id=request_id)
+    except Exception as e:
+        print(f"[ask] request_id={request_id} 问答失败：{e}")
+        return AskResponse(answer=harness.error_message(e), verified=False,
+                           answer_status="error", citations=[])
     return AskResponse(answer=result["answer"], verified=result["verified"],
                        answer_status=result.get("answer_status", "refused"),
                        citations=result["citations"])
@@ -71,10 +84,17 @@ def ask_stream(req: AskRequest):
       {"type": "error", "message": "..."}  出错（run 抛异常时）
     """
     def events():
+        request_id = harness.new_request_id()
         try:
-            result = run(req.query, history=req.history, thread_id=req.thread_id or None)
+            result = harness.run_with_timeout(
+                run, harness.RUN_TIMEOUT_SECONDS,
+                req.query, history=req.history, thread_id=req.thread_id or None,
+                request_id=request_id)
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+            # 超时用友好文本；其他异常保留原始信息（流式是调试路径，
+            # 现有测试要求 error 事件里能看到原始异常）。
+            message = harness.error_message(e) if isinstance(e, harness.HarnessTimeout) else str(e)
+            yield f"data: {json.dumps({'type': 'error', 'message': message}, ensure_ascii=False)}\n\n"
             return
         for chunk in _split_stream_chunks(result["answer"]):
             yield f"data: {json.dumps({'type': 'token', 'text': chunk}, ensure_ascii=False)}\n\n"

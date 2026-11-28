@@ -17,6 +17,7 @@ import re
 from typing import TypedDict, List
 
 from .config import CHECKPOINTS_DB, LLM_BASE_URL, LLM_MODEL, PUBMED_CANDIDATE_K, PUBMED_TOP_K, get_api_key, tracing_enabled
+from . import harness
 from .memory import MAX_HISTORY_CHARS, MAX_HISTORY_TURNS
 from . import memory
 from .prompts import load_prompt
@@ -186,7 +187,8 @@ def _classify_by_llm(query: str) -> dict:
     """LLM 分类：规则覆盖不了时调 LLM。输出解析失败、LLM 没调通时，
     退回简单事实问答（retriever）——分类失败不断问答。"""
     try:
-        raw = _call_llm(ROUTER_PROMPT.format(query=query))
+        with harness.node("router"):
+            raw = _call_llm(ROUTER_PROMPT.format(query=query))
     except Exception as e:
         print(f"[router] LLM 分类失败（{e}），退回简单问答")
         return _empty_route()
@@ -250,11 +252,12 @@ def _to_pubmed_query(query: str) -> str:
     if not re.search(r"[\u4e00-\u9fff]", q):
         return q
     try:
-        translated = _call_llm(
-            "把下面的中文问题翻译成 PubMed 英文检索式：找出核心概念，"
-            "给出 2-3 个英文同义表达，每个加英文双引号，用 OR 连接。"
-            "只输出检索式，不要解释：\n" + q
-        )
+        with harness.node("retriever"):
+            translated = _call_llm(
+                "把下面的中文问题翻译成 PubMed 英文检索式：找出核心概念，"
+                "给出 2-3 个英文同义表达，每个加英文双引号，用 OR 连接。"
+                "只输出检索式，不要解释：\n" + q
+            )
     except Exception as e:
         print(f"[pubmed] 翻译查询失败（{e}），用原问题搜索")
         return q
@@ -392,7 +395,8 @@ def planner_node(state: State):
     query = state.get("query", "")
     goal, queries = "", []
     try:
-        raw = _call_llm(PLANNER_PROMPT.format(query=query))
+        with harness.node("planner"):
+            raw = _call_llm(PLANNER_PROMPT.format(query=query))
         goal, queries = _parse_plan(raw)
     except Exception as e:
         print(f"[planner] 拆解失败（{e}），退回单个子任务")
@@ -486,7 +490,8 @@ def executor_node(state: State):
         while steps < MAX_EXECUTOR_STEPS:
             # 选工具：LLM 按子任务 + 工具描述选；选不出来用默认 local_search
             try:
-                raw = _call_llm(_build_executor_prompt(st.get("query", "")))
+                with harness.node("executor"):
+                    raw = _call_llm(_build_executor_prompt(st.get("query", "")))
             except Exception as e:
                 print(f"[executor] 选工具失败（{e}），用默认 local_search")
                 raw = ""
@@ -642,18 +647,24 @@ def retriever_node(state: State):
     # 没历史时 retrieval_query 就是原问题。把 _call_llm 传给 retrieve，
     # 让它在内部把中文问题翻成英文再查向量（跨语言向量检索弱，Q09 的教训）；
     # 没 key 时 _call_llm 返回空，翻译退回原问题，检索不断。
-    chunks = retrieve(state.get("retrieval_query") or state["query"], top_k=10, llm_call=_call_llm)
+    # 翻译那次 LLM 调用也算 retriever 节点的（node 上下文包着 retrieve）。
+    with harness.node("retriever"):
+        chunks = retrieve(state.get("retrieval_query") or state["query"], top_k=10, llm_call=_call_llm)
     return {"chunks": chunks}
 
 
 def _call_llm(prompt: str) -> str:
-    """有 key 才调 Qwen/DeepSeek（OpenAI 兼容接口），无 key 返回空，由调用方走占位分支。"""
+    """有 key 才调 Qwen/DeepSeek（OpenAI 兼容接口），无 key 返回空，由调用方走占位分支。
+    Harness（3.4）：每次调用都记耗时和 Token（request_id + 节点 + 耗时 + Token
+    的统一日志，节点名来自 harness.node() 上下文，由调用方节点包一层 with
+    设定）；HTTP 超时走 LLM_TIMEOUT_SECONDS；累计 Token 超预算时记
+    一条告警、降级继续，不掐断。"""
     api_key = get_api_key()
     if not api_key:
         return ""
     from openai import OpenAI
 
-    client = OpenAI(api_key=api_key, base_url=LLM_BASE_URL)
+    client = OpenAI(api_key=api_key, base_url=LLM_BASE_URL, timeout=harness.LLM_TIMEOUT_SECONDS)
     if tracing_enabled():
         # LangSmith 追踪开着时，把这次 LLM 调用也记进 trace（能看到 prompt、
         # 返回、耗时）；langsmith 没装或包不上就用原 client，问答不受影响。
@@ -664,12 +675,26 @@ def _call_llm(prompt: str) -> str:
             client = wrap_openai(client)
         except Exception:
             pass
-    resp = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-    return (resp.choices[0].message.content or "").strip()
+    timer = harness.Timer()
+    try:
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+    finally:
+        elapsed = timer.elapsed_ms()
+    text = (resp.choices[0].message.content or "").strip()
+    tokens = harness.estimate_tokens(prompt) + harness.estimate_tokens(text)
+    node = harness.get_node() or "llm"
+    budget = harness.get_token_budget()
+    if budget is not None and not budget.consume_tokens(tokens):
+        harness.log_event(harness.get_request_id(), node,
+                          "Token 预算已超，降级继续", elapsed_ms=elapsed, tokens=tokens)
+    else:
+        harness.log_event(harness.get_request_id(), node,
+                          "LLM 调用完成", elapsed_ms=elapsed, tokens=tokens)
+    return text
 
 
 def answerer_node(state: State):
@@ -686,7 +711,19 @@ def answerer_node(state: State):
         prompt = build_pubmed_prompt(state["query"], pubmed_results, history=prompt_hist)
         reminder = PUBMED_RETRY_REMINDER
     elif state["chunks"]:
-        prompt = build_prompt(state["query"], state["chunks"], history=prompt_hist)
+        # Token 预算（3.4）：prompt 超上限时先丢最末尾的片段再重建，
+        # 至少留 1 条；还超就记一条日志、降级继续（核查员会兜底），
+        # 不直接拒答。state["chunks"] 本身不动，引用校验仍按全部证据来。
+        chunks_for_prompt = list(state["chunks"])
+        prompt = build_prompt(state["query"], chunks_for_prompt, history=prompt_hist)
+        while (len(chunks_for_prompt) > 1
+               and harness.estimate_tokens(prompt) > harness.MAX_PROMPT_TOKENS):
+            chunks_for_prompt = chunks_for_prompt[:-1]
+            prompt = build_prompt(state["query"], chunks_for_prompt, history=prompt_hist)
+        if harness.estimate_tokens(prompt) > harness.MAX_PROMPT_TOKENS:
+            harness.log_event(harness.get_request_id(), "answerer",
+                              "prompt 仍超 Token 预算，降级继续",
+                              tokens=harness.estimate_tokens(prompt))
         reminder = RETRY_REMINDER
     else:
         return {"draft": REFUSAL}
@@ -710,7 +747,8 @@ def answerer_node(state: State):
         # 重答：提醒模型只引用本次提供的依据，上一轮就是引用错了才回来的
         prompt = prompt + reminder
     try:
-        draft = _call_llm(prompt)
+        with harness.node("answerer"):
+            draft = _call_llm(prompt)
     except Exception as e:
         print(f"[answerer] LLM 调用失败：{e}")
         draft = ""
@@ -731,7 +769,8 @@ def _append_turn_to_history(state: State, final: str) -> dict:
     history.append({"role": "user", "content": state.get("query", "")})
     history.append({"role": "assistant", "content": final})
     kept, dropped = memory.normalize_history(history)
-    new_summary = memory.append_summary(state.get("history_summary") or "", dropped, llm_call=_call_llm)
+    with harness.node("memory"):
+        new_summary = memory.append_summary(state.get("history_summary") or "", dropped, llm_call=_call_llm)
     return {"history": kept, "history_summary": new_summary}
 
 
@@ -1231,7 +1270,8 @@ def _run_with_graph(query: str, history=None, use_pubmed: bool = True) -> dict:
     1.4：传入的历史超限时，被截掉的轮次先摘要进 history_summary（调一次 LLM，
     失败退回规则式），再丢；短历史不截断、不调 LLM，和原来一样。"""
     kept, dropped = memory.normalize_history(history)
-    history_summary = memory.append_summary("", dropped, llm_call=_call_llm)
+    with harness.node("memory"):
+        history_summary = memory.append_summary("", dropped, llm_call=_call_llm)
     history = kept
     retrieval_query = _build_retrieval_query(query, history)
     initial = {
@@ -1249,7 +1289,29 @@ def _run_with_graph(query: str, history=None, use_pubmed: bool = True) -> dict:
     return _to_response(result)
 
 
-def run(query: str, history=None, thread_id=None, use_pubmed: bool = True) -> dict:
+def run(query: str, history=None, thread_id=None, use_pubmed: bool = True, request_id: str = None) -> dict:
+    """问答入口（Harness 包装，3.1 + 3.4）：每次问答生成一个 request_id，
+    建一个 TokenBudget，全程挂在 ContextVar 上，_call_llm 每次调用都
+    记耗时和 Token；开始和结束各记一条统一日志（request_id + 耗时 +
+    累计 Token + 最终状态），一次问答的日志能用 request_id 串起来。
+    request_id 不给就新生成一个；真正的问答逻辑在 _run_inner。"""
+    rid = request_id or harness.new_request_id()
+    budget = harness.TokenBudget()
+    timer = harness.Timer()
+    harness.log_event(rid, "run", "问答开始")
+    token = harness.set_request_context(rid, budget)
+    result = {}
+    try:
+        result = _run_inner(query, history, thread_id, use_pubmed)
+    finally:
+        harness.reset_request_context(token)
+        harness.log_event(rid, "run",
+                          f"问答结束：{result.get('answer_status', '') if isinstance(result, dict) else ''}",
+                          elapsed_ms=timer.elapsed_ms(), tokens=budget.used)
+    return result
+
+
+def _run_inner(query: str, history=None, thread_id=None, use_pubmed: bool = True) -> dict:
     """问答入口。history 可选，不传就是原来的单轮问答；
     传了就是多轮：最近 6 轮进 prompt，追问拼上文去检索。
     thread_id 可选：传了就用 SQLite checkpointer 把这轮对话存下来，
@@ -1276,7 +1338,8 @@ def run(query: str, history=None, thread_id=None, use_pubmed: bool = True) -> di
                         # 传了 history：用传来的，摘要从传入的历史现算（不用库里的）
                         existing_summary = ""
                     kept, dropped = memory.normalize_history(history)
-                    history_summary = memory.append_summary(existing_summary, dropped, llm_call=_call_llm)
+                    with harness.node("memory"):
+                        history_summary = memory.append_summary(existing_summary, dropped, llm_call=_call_llm)
                     history = kept
                     retrieval_query = _build_retrieval_query(query, history)
                     initial = {
